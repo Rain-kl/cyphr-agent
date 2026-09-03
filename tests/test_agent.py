@@ -444,6 +444,56 @@ async def test_ws_client_message_routing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ws_client_message_loop_resilience() -> None:
+    """Verify _message_loop handles invalid json, non-dict payloads, and handler exceptions without crashing."""
+    config = AgentConfig()
+    monitor = SystemMonitor()
+    registry = ModelRegistry(preload_default=False)
+    job_runner = MagicMock(spec=JobRunner)
+    client = AgentWebSocketClient(config, monitor, registry, job_runner)
+
+    class MockAsyncIterWS:
+        def __init__(self, msgs: list[str]) -> None:
+            self.msgs = msgs
+            self.send = AsyncMock()
+
+        def __aiter__(self):
+            self._iter = iter(self.msgs)
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    messages = [
+        "not-a-valid-json",
+        json.dumps([1, 2, 3]),  # list payload (non-dict)
+        json.dumps("string payload"),  # string payload (non-dict)
+        json.dumps({"type": "fail_action"}),  # raises exception
+        json.dumps({
+            "type": "command",
+            "action": "dispatch_job",
+            "payload": {"job_id": 77},
+        }),
+    ]
+    mock_ws = MockAsyncIterWS(messages)
+
+    orig_handle = client._handle_message
+
+    async def mock_handle(ws, data):
+        if data.get("type") == "fail_action":
+            raise RuntimeError("simulated error in handler")
+        return await orig_handle(ws, data)
+
+    client._handle_message = mock_handle
+
+    await client._message_loop(mock_ws)
+    job_runner.run_job.assert_called_once_with({"job_id": 77})
+
+
+@pytest.mark.asyncio
 async def test_job_runner_sync_engine_gil_protection(tmp_path: Path) -> None:
     """Verify that synchronous / blocking CPU engines run safely via threadpool executor."""
     media_dir = tmp_path / "sync_media"

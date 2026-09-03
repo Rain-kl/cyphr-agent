@@ -125,7 +125,13 @@ class AgentWebSocketClient:
                 logger.error("Failed to decode JSON message from controller: %s", e)
                 continue
 
-            await self._handle_message(ws, data)
+            if not isinstance(data, dict):
+                logger.warning("Ignoring non-dict WS payload: %s", type(data))
+                continue
+            try:
+                await self._handle_message(ws, data)
+            except Exception as exc:
+                logger.exception("Error handling WS message: %s", exc)
 
     async def _handle_message(
         self,
