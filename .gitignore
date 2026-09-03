@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Allow agent config.yaml
+!config.yaml
+
+
 # C extensions
 *.so
 
