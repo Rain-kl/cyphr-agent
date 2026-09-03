@@ -6,6 +6,8 @@ from collections.abc import Callable
 
 from .base import BaseEngine
 from .mock_asr import MockASREngine
+from .qwen3_asr import MODEL_NAME as QWEN3_ASR_MODEL_NAME
+from .qwen3_asr import Qwen3ASREngine
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,8 @@ class ModelRegistry:
 
         # Pre-register mock-whisper-base
         self.register("mock-whisper-base", lambda: MockASREngine(model_name="mock-whisper-base"))
+        # Real model: local Qwen3-ASR-0.6B package under backend/agent/models/
+        self.register(QWEN3_ASR_MODEL_NAME, lambda: Qwen3ASREngine())
 
         if preload_default:
             engine = self._factories["mock-whisper-base"]()
@@ -62,11 +66,7 @@ class ModelRegistry:
 
     def list_loaded_models(self) -> list[str]:
         """List names of all currently loaded models."""
-        return [
-            name
-            for name, engine in self._loaded_engines.items()
-            if engine.loaded
-        ]
+        return [name for name, engine in self._loaded_engines.items() if engine.loaded]
 
     def list_available_models(self) -> list[str]:
         """List names of all models known to the registry."""
