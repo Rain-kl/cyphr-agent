@@ -89,17 +89,41 @@ class Qwen3ASREngine(BaseEngine):
             raise FileNotFoundError(f"Model package missing in {self.model_dir}")
         if torch.cuda.is_available():
             device, dtype = "cuda:0", torch.bfloat16
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16"))
         elif torch.backends.mps.is_available():
             device, dtype = "mps", torch.float16
+            batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "4"))
         else:
             device, dtype = "cpu", torch.float32
-        logger.info("Loading %s from %s on %s (%s)", self.model_name, self.model_dir, device, dtype)
+            batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "1"))
+
+        load_kwargs: dict[str, Any] = {
+            "dtype": dtype,
+            "device_map": device,
+            "max_inference_batch_size": batch_size,
+            "max_new_tokens": self.max_new_tokens,
+        }
+        try:
+            import flash_attn  # noqa: F401
+            load_kwargs["attn_implementation"] = "flash_attention_2"
+        except ImportError:
+            load_kwargs["attn_implementation"] = "sdpa"
+
+        logger.info(
+            "Loading %s from %s on %s (%s, batch_size=%d, attn=%s)",
+            self.model_name,
+            self.model_dir,
+            device,
+            dtype,
+            batch_size,
+            load_kwargs.get("attn_implementation", "sdpa"),
+        )
         self._model = Qwen3ASRModel.from_pretrained(
             str(self.model_dir),
-            dtype=dtype,
-            device_map=device,
-            max_inference_batch_size=1,
-            max_new_tokens=self.max_new_tokens,
+            **load_kwargs,
         )
 
     async def unload(self) -> None:
@@ -182,26 +206,44 @@ class Qwen3ASREngine(BaseEngine):
             except OSError:
                 pass
 
+        import torch
+
         duration = len(wav) / SAMPLE_RATE
         segments, texts, langs = [], [], []
         total = len(chunks)
-        for i, (cwav, offset) in enumerate(chunks, 1):
-            _log(50 + int(45 * i / max(total, 1)), f"Running ASR inference ({i}/{total})...")
-            out = self._model.transcribe(audio=(cwav, SAMPLE_RATE), language=lang)[0]
-            text = (out.text or "").strip()
-            if out.language and out.language not in langs:
-                langs.append(out.language)
-            if text:
-                texts.append(text)
-                segments.append(
-                    {
-                        "id": len(segments),
-                        "seek": int(offset * 100),
-                        "start": round(offset, 2),
-                        "end": round(offset + len(cwav) / SAMPLE_RATE, 2),
-                        "text": text,
-                    }
-                )
+        batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16" if torch.cuda.is_available() else "1"))
+        batch_size = max(1, batch_size)
+
+        with torch.inference_mode():
+            for i in range(0, total, batch_size):
+                batch = chunks[i : i + batch_size]
+                cur_end = min(i + batch_size, total)
+                _log(50 + int(45 * cur_end / max(total, 1)), f"Running ASR batch inference ({cur_end}/{total})...")
+
+                audio_inputs = [(cwav, SAMPLE_RATE) for cwav, _ in batch]
+                try:
+                    outs = self._model.transcribe(audio=audio_inputs, language=lang)
+                except Exception:
+                    outs = [
+                        self._model.transcribe(audio=(cwav, SAMPLE_RATE), language=lang)[0]
+                        for cwav, _ in batch
+                    ]
+
+                for (cwav, offset), out in zip(batch, outs):
+                    text = (out.text or "").strip()
+                    if out.language and out.language not in langs:
+                        langs.append(out.language)
+                    if text:
+                        texts.append(text)
+                        segments.append(
+                            {
+                                "id": len(segments),
+                                "seek": int(offset * 100),
+                                "start": round(offset, 2),
+                                "end": round(offset + len(cwav) / SAMPLE_RATE, 2),
+                                "text": text,
+                            }
+                        )
         _log(100, "Aligning timestamps and finalizing transcript...")
         return {
             "task": task_type or "transcribe",
