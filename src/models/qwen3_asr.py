@@ -127,17 +127,39 @@ class Qwen3ASREngine(BaseEngine):
         )
 
     async def unload(self) -> None:
-        self._model = None
-        gc.collect()
+        if self._model is not None:
+            try:
+                # Detach modules from GPU to CPU to immediately release CUDA tensor blocks
+                if hasattr(self._model, "model") and hasattr(self._model.model, "to"):
+                    self._model.model.to("cpu")
+                if hasattr(self._model, "to"):
+                    self._model.to("cpu")
+            except Exception:
+                pass
+            self._model = None
+
+        for _ in range(3):
+            gc.collect()
+
         try:
             import torch
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                torch.cuda.synchronize()
+                allocated = torch.cuda.memory_allocated() / (1024 * 1024)
+                reserved = torch.cuda.memory_reserved() / (1024 * 1024)
+                logger.info(
+                    "CUDA memory after model unload: allocated=%.2fMB, reserved=%.2fMB",
+                    allocated,
+                    reserved,
+                )
             elif torch.backends.mps.is_available():
                 torch.mps.empty_cache()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed during CUDA cache cleanup: %s", e)
+
         self.loaded = False
 
     def transcribe(
