@@ -14,7 +14,7 @@ class BaseEngine(ABC):
         self.loaded = False
 
     @abstractmethod
-    async def load(self) -> None:
+    async def load(self, work_mode: str = "gpu") -> None:
         """Load model weights and initialize inference resources."""
 
     @abstractmethod

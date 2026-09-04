@@ -15,12 +15,34 @@ from .qwen3_asr import (
 logger = logging.getLogger(__name__)
 
 
+def detect_supported_modes() -> tuple[list[str], str]:
+    """Detect available acceleration hardware."""
+    has_gpu = False
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            has_gpu = True
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            has_gpu = True
+    except Exception:
+        pass
+
+    if has_gpu:
+        return ["cpu", "gpu"], "gpu"
+    return ["cpu"], "cpu"
+
+
 class ModelRegistry:
     """Registry managing available ASR engine factories and loaded engine instances."""
 
     def __init__(self, preload_default: bool = True) -> None:
         self._factories: dict[str, Callable[[], BaseEngine]] = {}
         self._loaded_engines: dict[str, BaseEngine] = {}
+
+        supported, default_mode = detect_supported_modes()
+        self._supported_modes: list[str] = supported
+        self._current_mode: str = default_mode
 
         # Pre-register mock-whisper-base
         self.register("mock-whisper-base", lambda: MockASREngine(model_name="mock-whisper-base"))
@@ -37,25 +59,51 @@ class ModelRegistry:
             engine.loaded = True
             self._loaded_engines["mock-whisper-base"] = engine
 
+    def get_supported_modes(self) -> list[str]:
+        """List supported inference modes on this machine (e.g. ['cpu', 'gpu'])."""
+        return list(self._supported_modes)
+
+    def get_current_mode(self) -> str:
+        """Get current inference work mode ('cpu' or 'gpu')."""
+        return self._current_mode
+
+    async def set_work_mode(self, mode: str) -> None:
+        """Set target work mode ('cpu' or 'gpu'). Unloads existing models if mode changed."""
+        mode = mode.lower().strip()
+        if mode not in self._supported_modes:
+            raise ValueError(f"Mode '{mode}' is not supported on this agent (supported: {self._supported_modes})")
+
+        if mode != self._current_mode:
+            logger.info("Switching work mode from %s to %s", self._current_mode, mode)
+            self._current_mode = mode
+            # Unload all models so future loads use the new device mode
+            await self.unload_all_models()
+
     def register(self, model_name: str, factory: Callable[[], BaseEngine]) -> None:
         """Register a model factory."""
         self._factories[model_name] = factory
 
     async def load_model(self, model_name: str) -> BaseEngine:
-        """Load and cache an engine instance by model name."""
+        """Load and cache an engine instance by model name using current work mode."""
         if model_name in self._loaded_engines:
             engine = self._loaded_engines[model_name]
             if not engine.loaded:
-                await engine.load()
+                try:
+                    await engine.load(work_mode=self._current_mode)
+                except TypeError:
+                    await engine.load()
             return engine
 
         if model_name not in self._factories:
             raise ValueError(f"Unknown or unregistered model: {model_name}")
 
         engine = self._factories[model_name]()
-        await engine.load()
+        try:
+            await engine.load(work_mode=self._current_mode)
+        except TypeError:
+            await engine.load()
         self._loaded_engines[model_name] = engine
-        logger.info("Loaded model '%s'", model_name)
+        logger.info("Loaded model '%s' (mode=%s)", model_name, self._current_mode)
         return engine
 
     async def unload_model(self, model_name: str) -> bool:
@@ -67,6 +115,28 @@ class ModelRegistry:
             logger.info("Unloaded model '%s'", model_name)
             return True
         return False
+
+    async def unload_all_models(self) -> list[str]:
+        """Unload and remove all currently loaded engine instances."""
+        unloaded = []
+        for name in list(self._loaded_engines.keys()):
+            engine = self._loaded_engines[name]
+            try:
+                await engine.unload()
+                unloaded.append(name)
+            except Exception as e:
+                logger.error("Error unloading model %s: %s", name, e)
+            finally:
+                self._loaded_engines.pop(name, None)
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        logger.info("Unloaded all models: %s", unloaded)
+        return unloaded
 
     def get_engine(self, model_name: str) -> BaseEngine | None:
         """Retrieve a currently loaded engine instance, if any."""

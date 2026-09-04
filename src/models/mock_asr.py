@@ -21,7 +21,7 @@ class MockASREngine(BaseEngine):
         super().__init__(model_name)
         self.stage_delay = stage_delay
 
-    async def load(self) -> None:
+    async def load(self, work_mode: str = "gpu") -> None:
         """Simulate loading model weights."""
         if self.stage_delay > 0:
             await asyncio.sleep(self.stage_delay)

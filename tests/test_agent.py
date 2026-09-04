@@ -603,4 +603,58 @@ async def test_ws_client_heartbeat_payload() -> None:
     assert p["running_jobs"] == 2
     assert "cpu_percent" in p["system"]
     assert "ram_percent" in p["system"]
+    assert "supported_modes" in p
+    assert "current_mode" in p
+
+
+@pytest.mark.asyncio
+async def test_registry_work_mode_and_unload_all() -> None:
+    """Test setting work mode, mode validation, and unload_all_models."""
+    registry = ModelRegistry(preload_default=True)
+    assert len(registry.list_loaded_models()) == 1
+
+    # Unload all models
+    unloaded = await registry.unload_all_models()
+    assert "mock-whisper-base" in unloaded
+    assert len(registry.list_loaded_models()) == 0
+
+    # Ensure cpu mode is always supported
+    assert "cpu" in registry.get_supported_modes()
+    await registry.set_work_mode("cpu")
+    assert registry.get_current_mode() == "cpu"
+
+    # Loading a model in CPU mode
+    engine = await registry.load_model("mock-whisper-base")
+    assert engine.loaded
+    assert "mock-whisper-base" in registry.list_loaded_models()
+
+    # Invalid mode raises ValueError
+    with pytest.raises(ValueError):
+        await registry.set_work_mode("invalid-mode-xyz")
+
+
+@pytest.mark.asyncio
+async def test_ws_client_work_mode_and_unload_all_handling() -> None:
+    """Test WS client handling of set_work_mode and unload_all_models messages."""
+    config = AgentConfig()
+    monitor = SystemMonitor()
+    registry = ModelRegistry(preload_default=True)
+    job_runner = MagicMock(spec=JobRunner)
+    client = AgentWebSocketClient(config, monitor, registry, job_runner)
+
+    mock_ws = AsyncMock()
+
+    # 1. Test unload_all_models message
+    await client._handle_message(mock_ws, {"type": "command", "action": "unload_all_models", "payload": {}})
+    assert len(registry.list_loaded_models()) == 0
+    assert mock_ws.send.called
+    status_msg = json.loads(mock_ws.send.call_args[0][0])
+    assert status_msg["type"] == "model_status"
+    assert status_msg["payload"]["loaded_models"] == []
+
+    # 2. Test set_work_mode message
+    mock_ws.reset_mock()
+    await client._handle_message(mock_ws, {"type": "command", "action": "set_work_mode", "payload": {"mode": "cpu"}})
+    assert registry.get_current_mode() == "cpu"
+    assert mock_ws.send.call_count >= 1
 

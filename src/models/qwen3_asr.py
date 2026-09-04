@@ -88,14 +88,14 @@ class Qwen3ASREngine(BaseEngine):
         self.max_new_tokens = max_new_tokens
         self._model = None
 
-    async def load(self) -> None:
+    async def load(self, work_mode: str = "gpu") -> None:
         """Load weights (blocking torch work runs in executor via caller)."""
         import asyncio
 
-        await asyncio.to_thread(self._load_blocking)
+        await asyncio.to_thread(self._load_blocking, work_mode)
         self.loaded = True
 
-    def _load_blocking(self) -> None:
+    def _load_blocking(self, work_mode: str = "gpu") -> None:
         import torch
         from qwen_asr import Qwen3ASRModel
 
@@ -116,7 +116,10 @@ class Qwen3ASREngine(BaseEngine):
                 f"Please run './scripts/download_model.sh {self.model_name}' first."
             )
 
-        if torch.cuda.is_available():
+        if work_mode == "cpu":
+            device, dtype = "cpu", torch.float32
+            batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "1"))
+        elif torch.cuda.is_available():
             device, dtype = "cuda:0", torch.bfloat16
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True

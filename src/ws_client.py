@@ -97,24 +97,30 @@ class AgentWebSocketClient:
         """Periodically transmit system stats and loaded models to controller."""
         while self._running:
             try:
-                loaded = self.registry.list_loaded_models()
-                payload = {
-                    "models": loaded,
-                    "loaded_models": loaded,
-                    "running_jobs": self.job_runner.get_running_jobs_count(),
-                    "system": self.monitor.collect(),
-                }
-                heartbeat_msg = {
-                    "type": "heartbeat",
-                    "payload": payload,
-                }
-                await ws.send(json.dumps(heartbeat_msg))
-                logger.debug("Heartbeat sent: %s", payload)
+                await self._send_heartbeat(ws)
             except Exception as exc:
                 logger.warning("Failed to send heartbeat: %s", exc)
                 break
 
             await asyncio.sleep(self.config.heartbeat_interval)
+
+    async def _send_heartbeat(self, ws: websockets.ClientConnection) -> None:
+        """Send a single heartbeat payload with hardware and model telemetry."""
+        loaded = self.registry.list_loaded_models()
+        payload = {
+            "models": loaded,
+            "loaded_models": loaded,
+            "running_jobs": self.job_runner.get_running_jobs_count(),
+            "supported_modes": self.registry.get_supported_modes(),
+            "current_mode": self.registry.get_current_mode(),
+            "system": self.monitor.collect(),
+        }
+        heartbeat_msg = {
+            "type": "heartbeat",
+            "payload": payload,
+        }
+        await ws.send(json.dumps(heartbeat_msg))
+        logger.debug("Heartbeat sent: %s", payload)
 
     async def _message_loop(self, ws: websockets.ClientConnection) -> None:
         """Receive and route signaling messages from controller."""
@@ -160,6 +166,17 @@ class AgentWebSocketClient:
                     await self._send_model_status(ws)
                 except Exception as e:
                     logger.error("Failed to load model '%s': %s", model_name, e)
+                    try:
+                        err_msg = {
+                            "type": "load_model_error",
+                            "payload": {
+                                "model_name": model_name,
+                                "error": str(e),
+                            },
+                        }
+                        await ws.send(json.dumps(err_msg))
+                    except Exception:
+                        pass
 
         elif effective_action == "unload_model":
             model_name = payload.get("model_name", "")
@@ -169,6 +186,23 @@ class AgentWebSocketClient:
                     await self._send_model_status(ws)
                 except Exception as e:
                     logger.error("Failed to unload model '%s': %s", model_name, e)
+
+        elif effective_action == "unload_all_models":
+            try:
+                await self.registry.unload_all_models()
+                await self._send_model_status(ws)
+            except Exception as e:
+                logger.error("Failed to unload all models: %s", e)
+
+        elif effective_action == "set_work_mode":
+            mode = payload.get("mode", "")
+            if mode:
+                try:
+                    await self.registry.set_work_mode(mode)
+                    await self._send_model_status(ws)
+                    await self._send_heartbeat(ws)
+                except Exception as e:
+                    logger.error("Failed to set work mode to '%s': %s", mode, e)
 
     async def _send_model_status(self, ws: websockets.ClientConnection) -> None:
         """Send immediate model status update back to controller."""
