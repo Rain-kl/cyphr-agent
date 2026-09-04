@@ -34,6 +34,25 @@ Configuration is loaded from `config.yaml` or overridden by environment variable
 
 ### Running
 
+#### Interactive Service Management (Recommended)
+
+Use the interactive management script:
+
+```bash
+./agent.sh
+```
+
+Or pass commands directly:
+
+```bash
+./agent.sh start    # Start service in background
+./agent.sh stop     # Stop running service
+./agent.sh status   # Check status and recent logs
+./agent.sh restart  # Restart service
+```
+
+#### Manual Run
+
 ```bash
 uv run python main.py
 ```
