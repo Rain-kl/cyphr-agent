@@ -163,18 +163,9 @@ class Qwen3ASREngine(BaseEngine):
 
     async def unload(self) -> None:
         if self._model is not None:
-            try:
-                # Detach modules from GPU to CPU to immediately release CUDA tensor blocks
-                if hasattr(self._model, "model") and hasattr(self._model.model, "to"):
-                    self._model.model.to("cpu")
-                if hasattr(self._model, "to"):
-                    self._model.to("cpu")
-            except Exception:
-                pass
             self._model = None
 
-        for _ in range(3):
-            gc.collect()
+        gc.collect()
 
         try:
             import torch

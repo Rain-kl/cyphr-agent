@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import time
@@ -14,6 +15,54 @@ from .models.registry import ModelRegistry
 from .reporter import Reporter
 
 logger = logging.getLogger(__name__)
+
+
+class DynamicSemaphore:
+    """An asyncio semaphore that supports dynamic capacity changes without leaking permits."""
+
+    def __init__(self, initial_capacity: int) -> None:
+        self._capacity = max(1, initial_capacity)
+        self._acquired = 0
+        self._cond = asyncio.Condition()
+        self._bg_tasks: set[asyncio.Task[None]] = set()
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def set_capacity(self, new_capacity: int) -> None:
+        if new_capacity <= 0:
+            return
+        self._capacity = new_capacity
+
+        async def _notify() -> None:
+            async with self._cond:
+                self._cond.notify_all()
+
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(_notify())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+        except RuntimeError:
+            pass
+
+    async def acquire(self) -> None:
+        async with self._cond:
+            while self._acquired >= self._capacity:
+                await self._cond.wait()
+            self._acquired += 1
+
+    async def release(self) -> None:
+        async with self._cond:
+            self._acquired = max(0, self._acquired - 1)
+            self._cond.notify_all()
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.release()
 
 
 class JobRunner:
@@ -30,7 +79,7 @@ class JobRunner:
         self.registry = registry
         self.media_dir = media_dir
         self.max_concurrent_jobs = max_concurrent_jobs
-        self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
+        self._semaphore = DynamicSemaphore(max_concurrent_jobs)
         self._inference_lock = asyncio.Lock()
         self._active_tasks: dict[int, asyncio.Task[None]] = {}
 
@@ -43,7 +92,7 @@ class JobRunner:
         if limit > 0 and limit != self.max_concurrent_jobs:
             logger.info("Updating max concurrent jobs from %d to %d", self.max_concurrent_jobs, limit)
             self.max_concurrent_jobs = limit
-            self._semaphore = asyncio.Semaphore(limit)
+            self._semaphore.set_capacity(limit)
 
     def run_job(self, payload: dict[str, Any]) -> asyncio.Task[None]:
         """Dispatch a job asynchronously in the background.
@@ -103,63 +152,64 @@ class JobRunner:
                 )
                 await self.reporter.download_media(job_id, local_file_path)
 
-                # 3. Resolve and load model if needed
-                engine = self.registry.get_engine(model_name)
-                if engine is None or not engine.loaded:
-                    engine = await self.registry.load_model(model_name)
+                # 3. Resolve and acquire model with lifecycle guard (ref counted, prevents hot-unload crash)
+                async with self.registry.acquire_engine(model_name) as engine:
+                    # 4. Engine log callback
+                    async def engine_log_cb(progress: int, message: str) -> None:
+                        ts = datetime.now(UTC).isoformat()
+                        try:
+                            await self.reporter.report_logs(
+                                job_id=job_id,
+                                progress=progress,
+                                logs=[{"timestamp": ts, "level": "info", "message": message}],
+                            )
+                        except Exception as log_err:
+                            logger.warning("Failed to report progress log: %s", log_err)
 
-                # 4. Engine log callback
-                async def engine_log_cb(progress: int, message: str) -> None:
-                    ts = datetime.now(UTC).isoformat()
-                    try:
+                    # 5. Perform inference with GIL protection for CPU-heavy / blocking tasks
+                    loop = asyncio.get_running_loop()
+                    if self._inference_lock.locked():
                         await self.reporter.report_logs(
                             job_id=job_id,
-                            progress=progress,
-                            logs=[{"timestamp": ts, "level": "info", "message": message}],
+                            progress=15,
+                            logs=[{
+                                "timestamp": datetime.now(UTC).isoformat(),
+                                "level": "info",
+                                "message": "Waiting for inference engine to become available...",
+                            }],
                         )
-                    except Exception as log_err:
-                        logger.warning("Failed to report progress log: %s", log_err)
 
-                # 5. Perform inference with GIL protection for CPU-heavy / blocking tasks
-                loop = asyncio.get_running_loop()
-                if self._inference_lock.locked():
-                    await self.reporter.report_logs(
-                        job_id=job_id,
-                        progress=15,
-                        logs=[{
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "level": "info",
-                            "message": "Waiting for inference engine to become available...",
-                        }],
-                    )
-
-                async with self._inference_lock:
-                    if asyncio.iscoroutinefunction(engine.transcribe):
-                        result = await engine.transcribe(
-                            audio_path=local_file_path,
-                            language=language,
-                            task_type=task_type,
-                            log_callback=engine_log_cb,
-                        )
-                    else:
-                        def sync_log_cb(p: int, msg: str) -> None:
-                            fut = asyncio.run_coroutine_threadsafe(
-                                engine_log_cb(p, msg),
-                                loop,
+                    async with self._inference_lock:
+                        if asyncio.iscoroutinefunction(engine.transcribe):
+                            result = await engine.transcribe(
+                                audio_path=local_file_path,
+                                language=language,
+                                task_type=task_type,
+                                log_callback=engine_log_cb,
                             )
-                            try:
-                                fut.result(timeout=5.0)
-                            except Exception as cb_err:
-                                logger.warning("Error in sync_log_cb: %s", cb_err)
+                        else:
+                            pending_log_futures: list[concurrent.futures.Future[Any]] = []
 
-                        result = await loop.run_in_executor(
-                            None,
-                            engine.transcribe,
-                            local_file_path,
-                            language,
-                            task_type,
-                            sync_log_cb,
-                        )
+                            def sync_log_cb(p: int, msg: str) -> None:
+                                # Fire-and-track asynchronously; do not block GPU inference worker thread
+                                fut = asyncio.run_coroutine_threadsafe(
+                                    engine_log_cb(p, msg),
+                                    loop,
+                                )
+                                pending_log_futures.append(fut)
+
+                            result = await loop.run_in_executor(
+                                None,
+                                engine.transcribe,
+                                local_file_path,
+                                language,
+                                task_type,
+                                sync_log_cb,
+                            )
+
+                            # Drain any in-flight log callbacks with concurrent wait (bounded to 0.5s)
+                            if pending_log_futures:
+                                concurrent.futures.wait(pending_log_futures, timeout=0.5)
 
                 # 6. Settle completion
                 duration = time.time() - start_time

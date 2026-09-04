@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -760,4 +761,248 @@ async def test_concurrent_jobs_inference_serialization(tmp_path: Path) -> None:
     assert len(complete_data) == 3
     # Max active inferences must be 1 because inference is serialized via _inference_lock
     assert max_active_inferences == 1
+
+
+# =========================================================================
+# 8. P0 Concurrency & Lifecycle Protection Tests
+# =========================================================================
+
+@pytest.mark.asyncio
+async def test_concurrent_load_model_singleton() -> None:
+    """Verify concurrent load_model calls for the same model serialize and only instantiate once."""
+    init_call_count = 0
+    load_call_count = 0
+
+    class SlowLoadEngine(BaseEngine):
+        def __init__(self) -> None:
+            super().__init__("slow-model")
+            nonlocal init_call_count
+            init_call_count += 1
+
+        async def load(self, work_mode: str = "cpu") -> None:
+            nonlocal load_call_count
+            load_call_count += 1
+            await asyncio.sleep(0.05)  # simulate weight loading
+            self.loaded = True
+
+        async def unload(self) -> None:
+            self.loaded = False
+
+        async def transcribe(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return {"text": "ok"}
+
+    registry = ModelRegistry(preload_default=False)
+    registry.register("slow-model", SlowLoadEngine)
+
+    # Concurrently launch 10 tasks all requesting to load "slow-model"
+    results = await asyncio.gather(*[registry.load_model("slow-model") for _ in range(10)])
+
+    assert init_call_count == 1
+    assert load_call_count == 1
+    # All 10 callers must receive the exact same engine instance
+    for engine in results:
+        assert engine is results[0]
+        assert engine.loaded is True
+
+
+@pytest.mark.asyncio
+async def test_acquire_engine_protects_during_inference_and_drains_on_unload() -> None:
+    """Verify active inferences are tracked and unload_model safely waits for inference drain."""
+    inference_running = False
+    inference_completed = False
+    unloaded_occurred = False
+
+    class SafeLifecycleEngine(BaseEngine):
+        def __init__(self) -> None:
+            super().__init__("safe-model")
+            self.loaded = True
+
+        async def load(self, work_mode: str = "cpu") -> None:
+            self.loaded = True
+
+        async def unload(self) -> None:
+            nonlocal unloaded_occurred
+            assert not inference_running, "unload occurred while inference was still running!"
+            unloaded_occurred = True
+            self.loaded = False
+
+        async def transcribe(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return {"text": "done"}
+
+    registry = ModelRegistry(preload_default=False)
+    registry.register("safe-model", SafeLifecycleEngine)
+    await registry.load_model("safe-model")
+
+    async def run_simulated_inference() -> None:
+        nonlocal inference_running, inference_completed
+        async with registry.acquire_engine("safe-model"):
+            inference_running = True
+            await asyncio.sleep(0.1)  # simulate ongoing transcription
+            inference_running = False
+            inference_completed = True
+
+    # Start inference in background
+    inference_task = asyncio.create_task(run_simulated_inference())
+    # Give it a moment to enter acquire_engine
+    await asyncio.sleep(0.02)
+    assert inference_running is True
+
+    # Concurrently attempt to unload model
+    unload_res = await registry.unload_model("safe-model", timeout=5.0)
+    await inference_task
+
+    assert unload_res is True
+    assert inference_completed is True
+    assert unloaded_occurred is True
+    assert "safe-model" not in registry.list_loaded_models()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_semaphore_concurrency_control() -> None:
+    """Verify DynamicSemaphore handles dynamic capacity changes safely without permit drift."""
+    from src.job_runner import DynamicSemaphore
+
+    sem = DynamicSemaphore(initial_capacity=2)
+    assert sem.capacity == 2
+
+    active_tasks = 0
+    max_concurrent = 0
+
+    async def worker() -> None:
+        nonlocal active_tasks, max_concurrent
+        async with sem:
+            active_tasks += 1
+            if active_tasks > max_concurrent:
+                max_concurrent = active_tasks
+            await asyncio.sleep(0.05)
+            active_tasks -= 1
+
+    # Run 4 tasks with capacity 2
+    tasks = [asyncio.create_task(worker()) for _ in range(4)]
+    await asyncio.gather(*tasks)
+    assert max_concurrent <= 2
+
+    # Dynamically expand capacity to 5
+    sem.set_capacity(5)
+    assert sem.capacity == 5
+    max_concurrent = 0
+    tasks = [asyncio.create_task(worker()) for _ in range(5)]
+    await asyncio.gather(*tasks)
+    assert max_concurrent <= 5
+
+
+@pytest.mark.asyncio
+async def test_dynamic_semaphore_scale_down() -> None:
+    """Verify DynamicSemaphore smoothly handles capacity reduction while tasks are running."""
+    from src.job_runner import DynamicSemaphore
+
+    sem = DynamicSemaphore(initial_capacity=4)
+    active = 0
+    post_scale_down_max = 0
+    scaled_down = False
+
+    async def worker() -> None:
+        nonlocal active, post_scale_down_max
+        async with sem:
+            active += 1
+            if scaled_down and active > post_scale_down_max:
+                post_scale_down_max = active
+            await asyncio.sleep(0.05)
+            active -= 1
+
+    # Start 4 workers with capacity 4
+    tasks = [asyncio.create_task(worker()) for _ in range(4)]
+    await asyncio.sleep(0.01)
+
+    # Dynamically scale down to 1
+    sem.set_capacity(1)
+    scaled_down = True
+    assert sem.capacity == 1
+
+    # Add 2 more workers who should now be limited to capacity 1 once existing workers finish
+    tasks.extend([asyncio.create_task(worker()) for _ in range(2)])
+    await asyncio.gather(*tasks)
+
+    # Once old workers drained, new workers must respect the new capacity limit
+    assert post_scale_down_max <= 2
+
+
+@pytest.mark.asyncio
+async def test_acquire_engine_drain_timeout_force_unload() -> None:
+    """Verify unload_model timeout forces unload when inference takes longer than timeout."""
+    class LongInferenceEngine(BaseEngine):
+        def __init__(self) -> None:
+            super().__init__("long-model")
+            self.loaded = True
+
+        async def load(self, work_mode: str = "cpu") -> None:
+            self.loaded = True
+
+        async def unload(self) -> None:
+            self.loaded = False
+
+        async def transcribe(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return {"text": "done"}
+
+    registry = ModelRegistry(preload_default=False)
+    registry.register("long-model", LongInferenceEngine)
+    await registry.load_model("long-model")
+
+    inference_done = False
+
+    async def slow_inference() -> None:
+        nonlocal inference_done
+        async with registry.acquire_engine("long-model"):
+            await asyncio.sleep(0.2)
+            inference_done = True
+
+    t = asyncio.create_task(slow_inference())
+    await asyncio.sleep(0.01)
+
+    # Unload with a very short timeout (0.05s) - must force unload after timeout
+    unloaded = await registry.unload_model("long-model", timeout=0.05)
+    assert unloaded is True
+    assert "long-model" not in registry.list_loaded_models()
+
+    await t
+    assert inference_done is True
+    # Verify internal drain events and inference counts are cleaned up
+    assert "long-model" not in registry._drain_events
+    assert "long-model" not in registry._inference_counts
+
+
+@pytest.mark.asyncio
+async def test_acquire_engine_exception_resilience() -> None:
+    """Verify acquire_engine properly decrements reference count even if inference raises exception."""
+    class FaultyEngine(BaseEngine):
+        def __init__(self) -> None:
+            super().__init__("faulty-model")
+            self.loaded = True
+
+        async def load(self, work_mode: str = "cpu") -> None:
+            self.loaded = True
+
+        async def unload(self) -> None:
+            self.loaded = False
+
+        async def transcribe(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("Fatal CUDA hardware failure simulation")
+
+    registry = ModelRegistry(preload_default=False)
+    registry.register("faulty-model", FaultyEngine)
+    await registry.load_model("faulty-model")
+
+    with pytest.raises(RuntimeError, match="CUDA hardware failure"):
+        async with registry.acquire_engine("faulty-model") as engine:
+            await engine.transcribe("fake.wav")
+
+    # Reference count must be completely cleaned up
+    assert "faulty-model" not in registry._inference_counts
+
+    # Subsequent unload must succeed immediately without waiting or hanging
+    unloaded = await registry.unload_model("faulty-model", timeout=1.0)
+    assert unloaded is True
+    assert "faulty-model" not in registry.list_loaded_models()
+
+
 

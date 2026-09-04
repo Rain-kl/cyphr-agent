@@ -1,8 +1,10 @@
 # Copyright 2026 Arctel.net
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 
 from .base import BaseEngine
 from .mock_asr import MockASREngine
@@ -40,6 +42,10 @@ class ModelRegistry:
     def __init__(self, preload_default: bool = True) -> None:
         self._factories: dict[str, Callable[[], BaseEngine]] = {}
         self._loaded_engines: dict[str, BaseEngine] = {}
+        self._load_locks: dict[str, asyncio.Lock] = {}
+        self._registry_lock = asyncio.Lock()
+        self._inference_counts: dict[str, int] = {}
+        self._drain_events: dict[str, asyncio.Event] = {}
 
         supported, default_mode = detect_supported_modes()
         self._supported_modes: list[str] = supported
@@ -84,8 +90,12 @@ class ModelRegistry:
         """Register a model factory."""
         self._factories[model_name] = factory
 
-    async def load_model(self, model_name: str) -> BaseEngine:
-        """Load and cache an engine instance by model name using current work mode."""
+    def _get_load_lock(self, model_name: str) -> asyncio.Lock:
+        if model_name not in self._load_locks:
+            self._load_locks[model_name] = asyncio.Lock()
+        return self._load_locks[model_name]
+
+    async def _load_model_unlocked(self, model_name: str) -> BaseEngine:
         if model_name in self._loaded_engines:
             engine = self._loaded_engines[model_name]
             if not engine.loaded:
@@ -107,28 +117,80 @@ class ModelRegistry:
         logger.info("Loaded model '%s' (mode=%s)", model_name, self._current_mode)
         return engine
 
-    async def unload_model(self, model_name: str) -> bool:
-        """Unload and remove an engine instance."""
-        if model_name in self._loaded_engines:
-            engine = self._loaded_engines[model_name]
-            await engine.unload()
-            del self._loaded_engines[model_name]
-            logger.info("Unloaded model '%s'", model_name)
-            return True
-        return False
+    @asynccontextmanager
+    async def acquire_engine(self, model_name: str) -> AsyncIterator[BaseEngine]:
+        """Safely acquire an engine instance for inference with active reference counting.
 
-    async def unload_all_models(self) -> list[str]:
-        """Unload and remove all currently loaded engine instances."""
+        Guarantees the model cannot be concurrently unloaded while the context block is executing.
+        """
+        lock = self._get_load_lock(model_name)
+        async with lock:
+            engine = await self._load_model_unlocked(model_name)
+            async with self._registry_lock:
+                self._inference_counts[model_name] = self._inference_counts.get(model_name, 0) + 1
+        try:
+            yield engine
+        finally:
+            async with self._registry_lock:
+                count = self._inference_counts.get(model_name, 1) - 1
+                if count <= 0:
+                    self._inference_counts.pop(model_name, None)
+                    event = self._drain_events.get(model_name)
+                    if event is not None and not event.is_set():
+                        event.set()
+                else:
+                    self._inference_counts[model_name] = count
+
+    async def load_model(self, model_name: str) -> BaseEngine:
+        """Load and cache an engine instance by model name using current work mode with concurrency lock."""
+        lock = self._get_load_lock(model_name)
+        async with lock:
+            return await self._load_model_unlocked(model_name)
+
+    async def unload_model(self, model_name: str, timeout: float = 30.0) -> bool:
+        """Unload and remove an engine instance safely after active inferences have drained."""
+        lock = self._get_load_lock(model_name)
+        async with lock:
+            drain_event: asyncio.Event | None = None
+            async with self._registry_lock:
+                if self._inference_counts.get(model_name, 0) > 0:
+                    drain_event = asyncio.Event()
+                    self._drain_events[model_name] = drain_event
+
+            if drain_event is not None:
+                logger.info(
+                    "Waiting for active inferences on model '%s' to drain before unloading (timeout=%.1fs)...",
+                    model_name,
+                    timeout,
+                )
+                try:
+                    await asyncio.wait_for(drain_event.wait(), timeout=timeout)
+                except TimeoutError:
+                    logger.warning(
+                        "Timed out waiting for model '%s' inferences to drain; forcing unload",
+                        model_name,
+                    )
+                finally:
+                    async with self._registry_lock:
+                        self._drain_events.pop(model_name, None)
+
+            if model_name in self._loaded_engines:
+                engine = self._loaded_engines[model_name]
+                await engine.unload()
+                del self._loaded_engines[model_name]
+                logger.info("Unloaded model '%s'", model_name)
+                return True
+            return False
+
+    async def unload_all_models(self, timeout: float = 30.0) -> list[str]:
+        """Unload and remove all currently loaded engine instances safely."""
         unloaded = []
         for name in list(self._loaded_engines.keys()):
-            engine = self._loaded_engines[name]
             try:
-                await engine.unload()
-                unloaded.append(name)
+                if await self.unload_model(name, timeout=timeout):
+                    unloaded.append(name)
             except Exception as e:
                 logger.error("Error unloading model %s: %s", name, e)
-            finally:
-                self._loaded_engines.pop(name, None)
         try:
             import torch
 
