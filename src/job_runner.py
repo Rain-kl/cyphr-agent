@@ -38,6 +38,13 @@ class JobRunner:
         """Return number of currently active jobs."""
         return len(self._active_tasks)
 
+    def set_max_concurrent_jobs(self, limit: int) -> None:
+        """Update maximum concurrency limit dynamically."""
+        if limit > 0 and limit != self.max_concurrent_jobs:
+            logger.info("Updating max concurrent jobs from %d to %d", self.max_concurrent_jobs, limit)
+            self.max_concurrent_jobs = limit
+            self._semaphore = asyncio.Semaphore(limit)
+
     def run_job(self, payload: dict[str, Any]) -> asyncio.Task[None]:
         """Dispatch a job asynchronously in the background.
 

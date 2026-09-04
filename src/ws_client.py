@@ -107,9 +107,11 @@ class AgentWebSocketClient:
     async def _send_heartbeat(self, ws: websockets.ClientConnection) -> None:
         """Send a single heartbeat payload with hardware and model telemetry."""
         loaded = self.registry.list_loaded_models()
+        downloaded = self.registry.list_downloaded_models()
         payload = {
             "models": loaded,
             "loaded_models": loaded,
+            "downloaded_models": downloaded,
             "running_jobs": self.job_runner.get_running_jobs_count(),
             "supported_modes": self.registry.get_supported_modes(),
             "current_mode": self.registry.get_current_mode(),
@@ -203,6 +205,19 @@ class AgentWebSocketClient:
                     await self._send_heartbeat(ws)
                 except Exception as e:
                     logger.error("Failed to set work mode to '%s': %s", mode, e)
+
+        elif effective_action == "set_config":
+            max_jobs = payload.get("max_concurrent_jobs")
+            if isinstance(max_jobs, int) and max_jobs > 0:
+                self.job_runner.set_max_concurrent_jobs(max_jobs)
+            mode = payload.get("work_mode")
+            if mode:
+                try:
+                    await self.registry.set_work_mode(mode)
+                    await self._send_model_status(ws)
+                except Exception as e:
+                    logger.error("Failed to set work mode from set_config: %s", e)
+            await self._send_heartbeat(ws)
 
     async def _send_model_status(self, ws: websockets.ClientConnection) -> None:
         """Send immediate model status update back to controller."""

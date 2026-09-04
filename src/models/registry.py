@@ -10,6 +10,7 @@ from .qwen3_asr import (
     MODEL_NAME_0_6B,
     MODEL_NAME_1_7B,
     Qwen3ASREngine,
+    resolve_model_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,6 +150,31 @@ class ModelRegistry:
     def list_available_models(self) -> list[str]:
         """List names of all models known to the registry."""
         return list(self._factories.keys())
+
+    def list_downloaded_models(self) -> list[str]:
+        """List names of models whose weights/config are downloaded and ready on local disk."""
+        downloaded = ["mock-whisper-base"]
+
+        # Check Qwen models
+        for name in [MODEL_NAME_0_6B, MODEL_NAME_1_7B]:
+            model_dir = resolve_model_dir(name)
+            if model_dir.is_dir():
+                # Check for config.json and presence of safetensors/bin/pt weights
+                config_file = model_dir / "config.json"
+                if config_file.is_file():
+                    has_weights = any(
+                        p.suffix in {".safetensors", ".bin", ".pt"}
+                        for p in model_dir.iterdir()
+                        if p.is_file()
+                    )
+                    if has_weights:
+                        downloaded.append(name)
+                        if name == MODEL_NAME_0_6B:
+                            downloaded.append("Qwen/Qwen3-ASR-0.6B")
+                        elif name == MODEL_NAME_1_7B:
+                            downloaded.append("Qwen/Qwen3-ASR-1.7B")
+
+        return downloaded
 
 
 default_registry = ModelRegistry()
