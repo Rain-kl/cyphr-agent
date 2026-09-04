@@ -25,6 +25,7 @@ class DynamicSemaphore:
         self._acquired = 0
         self._cond = asyncio.Condition()
         self._bg_tasks: set[asyncio.Task[None]] = set()
+        self._notify_scheduled = False
 
     @property
     def capacity(self) -> int:
@@ -41,11 +42,34 @@ class DynamicSemaphore:
 
         try:
             loop = asyncio.get_running_loop()
-            task = loop.create_task(_notify())
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
         except RuntimeError:
-            pass
+            return
+        # 合并连续扩容/缩容的唤醒：若已有待执行 notify，直接复用，避免后台任务堆积泄漏。
+        self._bg_tasks = {t for t in self._bg_tasks if not t.done()}
+        if self._bg_tasks or self._notify_scheduled:
+            return
+        self._notify_scheduled = True
+        try:
+            # 线程安全地调度唤醒（set_capacity 可能被非事件循环线程调用）
+            loop.call_soon_threadsafe(lambda: self._schedule_notify(_notify))
+        except RuntimeError:
+            # 事件循环已关闭时静默跳过；等待者会在 acquire 轮询新 capacity 时自然通过
+            self._notify_scheduled = False
+            return
+
+    def _schedule_notify(self, coro_factory: Any) -> None:
+        self._notify_scheduled = False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        # 二次合并：若回调排队期间已有 notify 任务在飞，则跳过新建
+        self._bg_tasks = {t for t in self._bg_tasks if not t.done()}
+        if self._bg_tasks:
+            return
+        task = loop.create_task(coro_factory())
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def acquire(self) -> None:
         async with self._cond:
@@ -80,8 +104,17 @@ class JobRunner:
         self.media_dir = media_dir
         self.max_concurrent_jobs = max_concurrent_jobs
         self._semaphore = DynamicSemaphore(max_concurrent_jobs)
-        self._inference_lock = asyncio.Lock()
+        # 按 model_name 细粒度串行：同模型推理排队，不同模型可并行。
+        # key 仅为已注册模型名（数量有界），不会随 job 增长而泄漏。
+        self._inference_locks: dict[str, asyncio.Lock] = {}
         self._active_tasks: dict[int, asyncio.Task[None]] = {}
+
+    def _get_inference_lock(self, model_name: str) -> asyncio.Lock:
+        lock = self._inference_locks.get(model_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._inference_locks[model_name] = lock
+        return lock
 
     def get_running_jobs_count(self) -> int:
         """Return number of currently active jobs."""
@@ -153,9 +186,19 @@ class JobRunner:
                 await self.reporter.download_media(job_id, local_file_path)
 
                 # 3. Resolve and acquire model with lifecycle guard (ref counted, prevents hot-unload crash)
+                inference_lock = self._get_inference_lock(model_name)
                 async with self.registry.acquire_engine(model_name) as engine:
-                    # 4. Engine log callback
+                    # 4. Engine log callback (throttled: 同job间隔>=2s或progress增量>=10才上报)
+                    _last_log_time = 0.0
+                    _last_progress = -100
+
                     async def engine_log_cb(progress: int, message: str) -> None:
+                        nonlocal _last_log_time, _last_progress
+                        now = time.monotonic()
+                        is_first = _last_progress <= -100
+                        if not is_first and progress < 100:
+                            if (now - _last_log_time) < 2.0 and (progress - _last_progress) < 10:
+                                return
                         ts = datetime.now(UTC).isoformat()
                         try:
                             await self.reporter.report_logs(
@@ -165,10 +208,13 @@ class JobRunner:
                             )
                         except Exception as log_err:
                             logger.warning("Failed to report progress log: %s", log_err)
+                        else:
+                            _last_log_time = now
+                            _last_progress = progress
 
                     # 5. Perform inference with GIL protection for CPU-heavy / blocking tasks
                     loop = asyncio.get_running_loop()
-                    if self._inference_lock.locked():
+                    if inference_lock.locked():
                         await self.reporter.report_logs(
                             job_id=job_id,
                             progress=15,
@@ -179,7 +225,7 @@ class JobRunner:
                             }],
                         )
 
-                    async with self._inference_lock:
+                    async with inference_lock:
                         if asyncio.iscoroutinefunction(engine.transcribe):
                             result = await engine.transcribe(
                                 audio_path=local_file_path,

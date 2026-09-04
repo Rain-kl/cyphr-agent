@@ -108,14 +108,22 @@ class AgentWebSocketClient:
         """Send a single heartbeat payload with hardware and model telemetry."""
         loaded = self.registry.list_loaded_models()
         downloaded = self.registry.list_downloaded_models()
+        try:
+            detailed = self.registry.list_loaded_models_detailed()
+        except AttributeError:
+            detailed = list(loaded)
+        system = self.monitor.collect()
+        gpu_devices = system.get("gpu_devices", [])
         payload = {
             "models": loaded,
             "loaded_models": loaded,
+            "loaded_models_detailed": detailed,
             "downloaded_models": downloaded,
             "running_jobs": self.job_runner.get_running_jobs_count(),
             "supported_modes": self.registry.get_supported_modes(),
             "current_mode": self.registry.get_current_mode(),
-            "system": self.monitor.collect(),
+            "gpu_devices": gpu_devices,
+            "system": system,
         }
         heartbeat_msg = {
             "type": "heartbeat",
