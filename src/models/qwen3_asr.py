@@ -27,6 +27,128 @@ HF_REPO_MAP = {
     MODEL_NAME_1_7B: "Qwen/Qwen3-ASR-1.7B",
 }
 
+DEFAULT_MAX_NEW_TOKENS = 512
+MIN_MAX_NEW_TOKENS = 128
+MAX_MAX_NEW_TOKENS = 1024
+
+DEFAULT_MAX_BATCH_SECONDS = 180.0
+
+SILENCE_THRESHOLD_DB = -40.0
+
+FFMPEG_BIN = "ffmpeg"
+FFMPEG_BASE_ARGS: tuple[str, ...] = ("-y", "-hide_banner", "-nostdin", "-loglevel", "error")
+FFMPEG_CONVERT_ARGS: tuple[str, ...] = (
+    "-vn", "-ac", "1", "-ar", str(TARGET_SR), "-f", "s16le", "pipe:1"
+)
+
+
+def resolve_max_new_tokens(explicit: int | None = None) -> int:
+    """Resolve max_new_tokens: env wins, else explicit/default, clamped 128~1024."""
+    raw = os.getenv("QWEN3_ASR_MAX_NEW_TOKENS")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(MIN_MAX_NEW_TOKENS, min(MAX_MAX_NEW_TOKENS, int(float(str(raw).strip()))))
+        except (TypeError, ValueError):
+            pass
+    if explicit is None:
+        return DEFAULT_MAX_NEW_TOKENS
+    try:
+        return max(MIN_MAX_NEW_TOKENS, min(MAX_MAX_NEW_TOKENS, int(explicit)))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_NEW_TOKENS
+
+
+def resolve_max_batch_seconds(explicit: float | None = None) -> float:
+    """Resolve per-batch audio budget in seconds: env $QWEN3_ASR_MAX_BATCH_SECONDS wins."""
+    raw = os.getenv("QWEN3_ASR_MAX_BATCH_SECONDS")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            v = float(str(raw).strip())
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    if explicit is not None:
+        try:
+            v = float(explicit)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_MAX_BATCH_SECONDS
+
+
+def should_skip_silence() -> bool:
+    return os.getenv("QWEN3_ASR_SKIP_SILENCE", "1").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
+def is_silent_chunk(audio: Any, threshold_db: float = SILENCE_THRESHOLD_DB) -> bool:
+    """Lightweight energy VAD: True when RMS < threshold_db (default -40dB)."""
+    try:
+        import math
+
+        arr = np.asarray(audio, dtype=np.float64)
+        if arr.size == 0:
+            return True
+        rms = float(np.sqrt(np.mean(arr * arr)))
+        if rms <= 1e-9:
+            return True
+        return (20.0 * math.log10(rms)) < threshold_db
+    except Exception:
+        return False
+
+
+def is_oom_error(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower().replace("_", "")
+    if "outofmemory" in name or name == "oomerror":
+        return True
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or " oom" in msg
+        or msg.startswith("oom")
+        or "cudnn out of memory" in msg
+    )
+
+
+def split_chunks_by_seconds(
+    chunks: list, max_batch_seconds: float, max_count: int | None = None
+) -> list:
+    """Pack chunks into batches capped by max_batch_seconds (and optional max_count)."""
+    if not max_batch_seconds or max_batch_seconds <= 0:
+        max_batch_seconds = DEFAULT_MAX_BATCH_SECONDS
+    batches: list = []
+    cur: list = []
+    cur_sec = 0.0
+    for ch in chunks:
+        cwav, _ = ch
+        try:
+            dur = len(cwav) / TARGET_SR
+        except Exception:
+            dur = CHUNK_SEC
+        if cur and (
+            cur_sec + dur > max_batch_seconds
+            or (max_count is not None and len(cur) >= max_count)
+        ):
+            batches.append(cur)
+            cur = []
+            cur_sec = 0.0
+        cur.append(ch)
+        cur_sec += dur
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def should_enable_cudnn_benchmark() -> bool:
+    return os.getenv("QWEN3_ASR_CUDNN_BENCHMARK", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def should_enable_torch_compile() -> bool:
+    return os.getenv("QWEN3_ASR_TORCH_COMPILE", "0").strip().lower() in ("1", "true", "yes", "on")
+
 
 def resolve_device_and_dtype(work_mode: str = "gpu") -> tuple[str, Any, int]:
     """Resolve target inference device, dtype, and default batch size.
@@ -137,11 +259,11 @@ class Qwen3ASREngine(BaseEngine):
         self,
         model_name: str = MODEL_NAME,
         model_dir: str | Path | None = None,
-        max_new_tokens: int = 1024,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     ) -> None:
         super().__init__(model_name)
         self.model_dir = Path(model_dir) if model_dir else resolve_model_dir(model_name)
-        self.max_new_tokens = max_new_tokens
+        self.max_new_tokens = resolve_max_new_tokens(max_new_tokens)
         self._model = None
 
     async def load(self, work_mode: str = "gpu") -> None:
@@ -177,8 +299,10 @@ class Qwen3ASREngine(BaseEngine):
         if "cuda" in device:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
+            # cudnn.benchmark only helps fixed-shape batches; default off.
+            torch.backends.cudnn.benchmark = should_enable_cudnn_benchmark()
 
+        self.max_new_tokens = resolve_max_new_tokens(self.max_new_tokens)
         load_kwargs: dict[str, Any] = {
             "dtype": dtype,
             "device_map": device,
@@ -204,6 +328,64 @@ class Qwen3ASREngine(BaseEngine):
             model_source,
             **load_kwargs,
         )
+        if should_enable_torch_compile():
+            try:
+                self._model = torch.compile(self._model, backend="inductor", mode="reduce-overhead")
+            except Exception as e:
+                logger.warning("torch.compile failed, falling back to eager: %s", e)
+
+    def _transcribe_batch_with_oom_retry(
+        self,
+        batch: list,
+        lang: str | None,
+        batch_seconds: float,
+        batch_size_cap: int,
+    ) -> list:
+        """Transcribe one duration-batch; on OOM halve budget and retry, then single-chunk."""
+        from qwen_asr.inference.utils import SAMPLE_RATE as _SR
+
+        audio_inputs = [(cwav, _SR) for cwav, _ in batch]
+        try:
+            return self._model.transcribe(audio=audio_inputs, language=lang)
+        except Exception as batch_err:
+            if not is_oom_error(batch_err):
+                logger.warning("Batch failed, falling back to single-chunk: %s", batch_err)
+                return [
+                    self._model.transcribe(audio=(cwav, _SR), language=lang)[0]
+                    for cwav, _ in batch
+                ]
+            logger.warning(
+                "Batch OOM (size=%d), halving batch_seconds and retrying: %s", len(batch), batch_err
+            )
+
+        budget = batch_seconds
+        sub_batches: list = [batch]
+        for _ in range(3):
+            budget = budget / 2.0
+            sub_batches = split_chunks_by_seconds(batch, budget, batch_size_cap)
+            if len(sub_batches) <= 1 and len(batch) > 1:
+                mid = len(batch) // 2
+                sub_batches = [batch[:mid], batch[mid:]]
+            try:
+                outs: list = []
+                for sub in sub_batches:
+                    sub_inputs = [(cwav, _SR) for cwav, _ in sub]
+                    outs.extend(self._model.transcribe(audio=sub_inputs, language=lang))
+                return outs
+            except Exception as retry_err:
+                if not is_oom_error(retry_err):
+                    logger.warning("Retry failed (non-OOM), single-chunk fallback: %s", retry_err)
+                    break
+                logger.warning(
+                    "Retry OOM (budget=%.1fs, parts=%d): %s", budget, len(sub_batches), retry_err
+                )
+                continue
+
+        logger.warning("OOM retries exhausted, falling back to single-chunk")
+        return [
+            self._model.transcribe(audio=(cwav, _SR), language=lang)[0]
+            for cwav, _ in batch
+        ]
 
     async def unload(self) -> None:
         if self._model is not None:
@@ -262,12 +444,13 @@ class Qwen3ASREngine(BaseEngine):
                 logger.warning("log_callback failed: %s", e)
 
         _log(20, "Loading and decoding audio file...")
-        # Check if incoming audio is already a standard 16kHz mono audio (WAV or MP3) to avoid redundant conversion
+        # Fast path: any 16kHz mono audio readable by soundfile skips ffmpeg
+        # (WAV/MP3/FLAC/OGG/M4A all supported via libsndfile; only sr+channels checked).
         is_standard_audio = False
         try:
             import soundfile as sf
             with sf.SoundFile(audio_path) as info:
-                if info.samplerate == TARGET_SR and info.channels == 1 and info.format in ("WAV", "MP3"):
+                if info.samplerate == TARGET_SR and info.channels == 1:
                     is_standard_audio = True
         except Exception:
             is_standard_audio = False
@@ -280,22 +463,11 @@ class Qwen3ASREngine(BaseEngine):
             try:
                 r = subprocess.run(
                     [
-                        "ffmpeg",
-                        "-y",
-                        "-hide_banner",
-                        "-nostdin",
-                        "-loglevel",
-                        "error",
+                        FFMPEG_BIN,
+                        *FFMPEG_BASE_ARGS,
                         "-i",
                         audio_path,
-                        "-vn",
-                        "-ac",
-                        "1",
-                        "-ar",
-                        str(TARGET_SR),
-                        "-f",
-                        "s16le",
-                        "pipe:1",
+                        *FFMPEG_CONVERT_ARGS,
                     ],
                     capture_output=True,
                 )
@@ -316,27 +488,46 @@ class Qwen3ASREngine(BaseEngine):
 
         duration = len(wav) / SAMPLE_RATE
         segments, texts, langs = [], [], []
+        try:
+            batch_size_cap = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16" if torch.cuda.is_available() else "1"))
+        except (TypeError, ValueError):
+            batch_size_cap = 1
+        batch_size_cap = max(1, batch_size_cap)
+        max_batch_seconds = resolve_max_batch_seconds()
+
+        if should_skip_silence():
+            kept = [(cwav, offset) for cwav, offset in chunks if not is_silent_chunk(cwav)]
+            skipped = len(chunks) - len(kept)
+            if skipped:
+                _log(50, f"Skipped {skipped} silent chunk(s) via energy VAD...")
+            chunks = kept
+
         total = len(chunks)
-        batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16" if torch.cuda.is_available() else "1"))
-        batch_size = max(1, batch_size)
+        if total == 0:
+            _log(100, "Aligning timestamps and finalizing transcript...")
+            return {
+                "task": task_type or "transcribe",
+                "language": langs[0] if langs else (lang or ""),
+                "duration": round(duration, 2),
+                "text": "",
+                "segments": segments,
+            }
+        batches = split_chunks_by_seconds(chunks, max_batch_seconds, batch_size_cap)
 
         _log(48, "Waiting for model inference slot...")
         with self._inference_lock:
             with torch.inference_mode():
-                for i in range(0, total, batch_size):
-                    batch = chunks[i : i + batch_size]
-                    cur_end = min(i + batch_size, total)
-                    _log(50 + int(45 * cur_end / max(total, 1)), f"Running ASR batch inference ({cur_end}/{total})...")
+                done = 0
+                for batch in batches:
+                    done += len(batch)
+                    _log(
+                        50 + int(45 * done / max(total, 1)),
+                        f"Running ASR batch inference ({done}/{total})...",
+                    )
 
-                    audio_inputs = [(cwav, SAMPLE_RATE) for cwav, _ in batch]
-                    try:
-                        outs = self._model.transcribe(audio=audio_inputs, language=lang)
-                    except Exception as batch_err:
-                        logger.warning("Batch transcription failed, falling back to single-chunk: %s", batch_err)
-                        outs = [
-                            self._model.transcribe(audio=(cwav, SAMPLE_RATE), language=lang)[0]
-                            for cwav, _ in batch
-                        ]
+                    outs = self._transcribe_batch_with_oom_retry(
+                        batch, lang, max_batch_seconds, batch_size_cap
+                    )
 
                     for (cwav, offset), out in zip(batch, outs):
                         text = (out.text or "").strip()
