@@ -6,8 +6,11 @@ from collections.abc import Callable
 
 from .base import BaseEngine
 from .mock_asr import MockASREngine
-from .qwen3_asr import MODEL_NAME as QWEN3_ASR_MODEL_NAME
-from .qwen3_asr import Qwen3ASREngine
+from .qwen3_asr import (
+    MODEL_NAME_0_6B,
+    MODEL_NAME_1_7B,
+    Qwen3ASREngine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +25,12 @@ class ModelRegistry:
         # Pre-register mock-whisper-base
         self.register("mock-whisper-base", lambda: MockASREngine(model_name="mock-whisper-base"))
         # Real model: local Qwen3-ASR-0.6B package under backend/agent/models/
-        self.register(QWEN3_ASR_MODEL_NAME, lambda: Qwen3ASREngine())
+        self.register(MODEL_NAME_0_6B, lambda: Qwen3ASREngine(model_name=MODEL_NAME_0_6B))
+        # Real model: local Qwen3-ASR-1.7B package under backend/agent/models/
+        self.register(MODEL_NAME_1_7B, lambda: Qwen3ASREngine(model_name=MODEL_NAME_1_7B))
+        # Hugging Face aliases for seamless interoperability
+        self.register("Qwen/Qwen3-ASR-0.6B", lambda: Qwen3ASREngine(model_name=MODEL_NAME_0_6B))
+        self.register("Qwen/Qwen3-ASR-1.7B", lambda: Qwen3ASREngine(model_name=MODEL_NAME_1_7B))
 
         if preload_default:
             engine = self._factories["mock-whisper-base"]()

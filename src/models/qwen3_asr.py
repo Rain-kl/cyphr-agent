@@ -14,9 +14,16 @@ from .base import BaseEngine
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "qwen3-asr-0.6b"
+MODEL_NAME_0_6B = "qwen3-asr-0.6b"
+MODEL_NAME_1_7B = "qwen3-asr-1.7b"
+MODEL_NAME = MODEL_NAME_0_6B
 CHUNK_SEC = 30.0
 TARGET_SR = 16000
+
+HF_REPO_MAP = {
+    MODEL_NAME_0_6B: "Qwen/Qwen3-ASR-0.6B",
+    MODEL_NAME_1_7B: "Qwen/Qwen3-ASR-1.7B",
+}
 
 # ISO code -> Qwen3-ASR language name. Unknown values pass through untouched.
 LANG_MAP = {
@@ -54,10 +61,17 @@ LANG_MAP = {
 
 
 def resolve_model_dir(model_name: str = MODEL_NAME) -> Path:
-    """Local model package dir: $QWEN3_ASR_MODEL_DIR or backend/agent/models/<name>/."""
+    """Local model package dir:
+    1. Dedicated env: $QWEN3_ASR_1_7B_MODEL_DIR or $QWEN3_ASR_0_6B_MODEL_DIR
+    2. Generic env: $QWEN3_ASR_MODEL_DIR
+    3. Default path: backend/agent/models/<model_name>/
+    """
+    clean_name = model_name.lower().replace("-", "_").replace(".", "_")
+    if env := os.getenv(f"{clean_name.upper()}_MODEL_DIR"):
+        return Path(env)
     if env := os.getenv("QWEN3_ASR_MODEL_DIR"):
         return Path(env)
-    return Path(__file__).resolve().parent.parent.parent / "models" / model_name
+    return Path(__file__).resolve().parent.parent.parent / "models" / model_name.lower()
 
 
 class Qwen3ASREngine(BaseEngine):
@@ -85,8 +99,23 @@ class Qwen3ASREngine(BaseEngine):
         import torch
         from qwen_asr import Qwen3ASRModel
 
-        if not self.model_dir.joinpath("config.json").is_file():
-            raise FileNotFoundError(f"Model package missing in {self.model_dir}")
+        model_source: str
+        if self.model_dir.joinpath("config.json").is_file():
+            model_source = str(self.model_dir)
+        elif self.model_name.lower() in HF_REPO_MAP:
+            # Fallback to Hugging Face repo ID if offline weights directory is missing
+            model_source = HF_REPO_MAP[self.model_name.lower()]
+            logger.info(
+                "Local weights not found at %s; loading directly via Hugging Face ID: %s",
+                self.model_dir,
+                model_source,
+            )
+        else:
+            raise FileNotFoundError(
+                f"Model package missing in {self.model_dir}. "
+                f"Please run './scripts/download_model.sh {self.model_name}' first."
+            )
+
         if torch.cuda.is_available():
             device, dtype = "cuda:0", torch.bfloat16
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -115,14 +144,14 @@ class Qwen3ASREngine(BaseEngine):
         logger.info(
             "Loading %s from %s on %s (%s, batch_size=%d, attn=%s)",
             self.model_name,
-            self.model_dir,
+            model_source,
             device,
             dtype,
             batch_size,
             load_kwargs.get("attn_implementation", "sdpa"),
         )
         self._model = Qwen3ASRModel.from_pretrained(
-            str(self.model_dir),
+            model_source,
             **load_kwargs,
         )
 

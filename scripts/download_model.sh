@@ -8,6 +8,7 @@ set -euo pipefail
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo "Usage: ./download_model.sh [HF_MODEL_ID] [PKG_DIR] [OPTIONS]"
   echo "  e.g. ./download_model.sh Qwen/Qwen3-ASR-0.6B qwen3-asr-0.6b"
+  echo "  e.g. ./download_model.sh Qwen/Qwen3-ASR-1.7B qwen3-asr-1.7b"
   echo ""
   echo "Environment variables:"
   echo "  HF_ENDPOINT    Custom endpoint or mirror (default: https://huggingface.co, e.g. https://hf-mirror.com)"

@@ -170,6 +170,9 @@ async def test_model_registry_lifecycle() -> None:
     registry = ModelRegistry(preload_default=True)
     assert "mock-whisper-base" in registry.list_loaded_models()
     assert "mock-whisper-base" in registry.list_available_models()
+    assert "qwen3-asr-0.6b" in registry.list_available_models()
+    assert "qwen3-asr-1.7b" in registry.list_available_models()
+    assert "Qwen/Qwen3-ASR-1.7B" in registry.list_available_models()
 
     engine = registry.get_engine("mock-whisper-base")
     assert engine is not None
