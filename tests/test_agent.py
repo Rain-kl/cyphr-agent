@@ -658,3 +658,27 @@ async def test_ws_client_work_mode_and_unload_all_handling() -> None:
     assert registry.get_current_mode() == "cpu"
     assert mock_ws.send.call_count >= 1
 
+
+
+def test_qwen3_asr_missing_ffmpeg_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.models.qwen3_asr import Qwen3ASREngine
+    import subprocess
+
+    engine = Qwen3ASREngine("qwen3-asr-0.6b")
+    engine.loaded = True
+    engine._model = MagicMock()
+
+    # Create dummy non-wav file
+    test_mp3 = tmp_path / "test.mp3"
+    test_mp3.write_bytes(b"dummy mp3 data")
+
+    def mock_subprocess_run(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "ffmpeg")
+
+    monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        engine.transcribe(str(test_mp3))
+
+    assert "ffmpeg" in str(exc_info.value)
+    assert "cyphr 命令行客户端" in str(exc_info.value)

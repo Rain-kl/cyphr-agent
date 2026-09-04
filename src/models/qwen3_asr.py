@@ -224,41 +224,61 @@ class Qwen3ASREngine(BaseEngine):
                 logger.warning("log_callback failed: %s", e)
 
         _log(20, "Loading and decoding audio file...")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            wav_path = tmp.name
+        # Check if incoming audio is already a standard 16kHz mono WAV to avoid redundant conversion
+        is_standard_wav = False
         try:
-            r = subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-nostdin",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    audio_path,
-                    "-vn",
-                    "-ac",
-                    "1",
-                    "-ar",
-                    str(TARGET_SR),
-                    "-c:a",
-                    "pcm_s16le",
-                    wav_path,
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if r.returncode != 0:
-                raise RuntimeError(f"ffmpeg failed for {audio_path}: {r.stderr.strip()}")
-            _log(50, "Preprocessing audio chunks and extracting features...")
-            wav = normalize_audio_input(wav_path)
+            import soundfile as sf
+            with sf.SoundFile(audio_path) as info:
+                if info.format == "WAV" and info.samplerate == TARGET_SR and info.channels == 1:
+                    is_standard_wav = True
+        except Exception:
+            is_standard_wav = False
+
+        if is_standard_wav:
+            _log(50, "Direct audio feed detected (standard 16kHz mono WAV), skipping ffmpeg conversion...")
+            wav = normalize_audio_input(audio_path)
             chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
-        finally:
+        else:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = tmp.name
             try:
-                os.remove(wav_path)
-            except OSError:
-                pass
+                r = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-hide_banner",
+                        "-nostdin",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        audio_path,
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        str(TARGET_SR),
+                        "-c:a",
+                        "pcm_s16le",
+                        wav_path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if r.returncode != 0:
+                    raise RuntimeError(f"ffmpeg failed for {audio_path}: {r.stderr.strip()}")
+                _log(50, "Preprocessing audio chunks and extracting features...")
+                wav = normalize_audio_input(wav_path)
+                chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
+            except FileNotFoundError as fnf_err:
+                raise RuntimeError(
+                    "未在当前系统中检测到 ffmpeg 可执行程序。请安装 ffmpeg 并加入系统 PATH，"
+                    "或者使用 cyphr 命令行客户端 (CLI) 在上传前自动完成音频格式转换。"
+                ) from fnf_err
+            finally:
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
 
         import torch
 
