@@ -5,11 +5,12 @@ import gc
 import logging
 import os
 import subprocess
-import tempfile
 import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from .base import BaseEngine
 
@@ -25,6 +26,58 @@ HF_REPO_MAP = {
     MODEL_NAME_0_6B: "Qwen/Qwen3-ASR-0.6B",
     MODEL_NAME_1_7B: "Qwen/Qwen3-ASR-1.7B",
 }
+
+
+def resolve_device_and_dtype(work_mode: str = "gpu") -> tuple[str, Any, int]:
+    """Resolve target inference device, dtype, and default batch size.
+
+    Supports:
+    1. Explicit env override via $QWEN3_ASR_DEVICE (e.g. 'cuda:1', 'cuda', 'mps', 'cpu')
+    2. Multi-GPU dynamic index via $CUDA_DEVICE_INDEX (e.g. '0', '1', ...)
+    3. work_mode parameter ('cpu', 'gpu', or specific device like 'cuda:0')
+    4. Auto-detect CUDA with bf16/fp16 support, MPS on Apple Silicon, or CPU fallback.
+    """
+    import torch
+
+    env_device = os.getenv("QWEN3_ASR_DEVICE", "").strip().lower()
+    req_device = env_device or work_mode.strip().lower()
+
+    if req_device == "cpu":
+        batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "1"))
+        return "cpu", torch.float32, batch_size
+
+    if req_device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            logger.warning("CUDA requested (%s) but torch.cuda is not available; falling back to CPU", req_device)
+            return "cpu", torch.float32, int(os.getenv("QWEN3_ASR_BATCH_SIZE", "1"))
+        device = req_device if ":" in req_device else "cuda:0"
+        use_bf16 = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+        dtype = torch.bfloat16 if use_bf16 else torch.float16
+        batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16"))
+        return device, dtype, batch_size
+
+    if req_device == "mps":
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "4"))
+            return "mps", torch.float16, batch_size
+        logger.warning("MPS requested but torch.backends.mps is not available; falling back to CPU")
+        return "cpu", torch.float32, int(os.getenv("QWEN3_ASR_BATCH_SIZE", "1"))
+
+    # Generic "gpu" request
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        device_idx = int(os.getenv("CUDA_DEVICE_INDEX", "0"))
+        device_idx = min(max(0, device_idx), torch.cuda.device_count() - 1)
+        device = f"cuda:{device_idx}"
+        use_bf16 = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+        dtype = torch.bfloat16 if use_bf16 else torch.float16
+        batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16"))
+        return device, dtype, batch_size
+
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "4"))
+        return "mps", torch.float16, batch_size
+
+    return "cpu", torch.float32, int(os.getenv("QWEN3_ASR_BATCH_SIZE", "1"))
 
 # ISO code -> Qwen3-ASR language name. Unknown values pass through untouched.
 LANG_MAP = {
@@ -119,21 +172,12 @@ class Qwen3ASREngine(BaseEngine):
                 f"Please download model '{self.model_name}' first using cyphr-installer."
             )
 
-        if work_mode == "cpu":
-            device, dtype = "cpu", torch.float32
-            batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "1"))
-        elif torch.cuda.is_available():
-            device, dtype = "cuda:0", torch.bfloat16
+        device, dtype, batch_size = resolve_device_and_dtype(work_mode)
+
+        if "cuda" in device:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
-            batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16"))
-        elif torch.backends.mps.is_available():
-            device, dtype = "mps", torch.float16
-            batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "4"))
-        else:
-            device, dtype = "cpu", torch.float32
-            batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "1"))
 
         load_kwargs: dict[str, Any] = {
             "dtype": dtype,
@@ -233,8 +277,6 @@ class Qwen3ASREngine(BaseEngine):
             wav = normalize_audio_input(audio_path)
             chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
         else:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                wav_path = tmp.name
             try:
                 r = subprocess.run(
                     [
@@ -251,28 +293,24 @@ class Qwen3ASREngine(BaseEngine):
                         "1",
                         "-ar",
                         str(TARGET_SR),
-                        "-c:a",
-                        "pcm_s16le",
-                        wav_path,
+                        "-f",
+                        "s16le",
+                        "pipe:1",
                     ],
                     capture_output=True,
-                    text=True,
                 )
                 if r.returncode != 0:
-                    raise RuntimeError(f"ffmpeg failed for {audio_path}: {r.stderr.strip()}")
+                    err_msg = r.stderr.decode("utf-8", errors="replace").strip() if r.stderr else "unknown error"
+                    raise RuntimeError(f"ffmpeg failed for {audio_path}: {err_msg}")
                 _log(50, "Preprocessing audio chunks and extracting features...")
-                wav = normalize_audio_input(wav_path)
+                pcm_data = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+                wav = normalize_audio_input((pcm_data, TARGET_SR))
                 chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
             except FileNotFoundError as fnf_err:
                 raise RuntimeError(
                     "未在当前系统中检测到 ffmpeg 可执行程序。请安装 ffmpeg 并加入系统 PATH，"
                     "或者使用 cyphr 命令行客户端 (CLI) 在上传前自动完成音频格式转换。"
                 ) from fnf_err
-            finally:
-                try:
-                    os.remove(wav_path)
-                except OSError:
-                    pass
 
         import torch
 

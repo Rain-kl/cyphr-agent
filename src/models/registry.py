@@ -19,21 +19,26 @@ logger = logging.getLogger(__name__)
 
 
 def detect_supported_modes() -> tuple[list[str], str]:
-    """Detect available acceleration hardware."""
-    has_gpu = False
+    """Detect available acceleration hardware and multi-GPU devices."""
+    modes = ["cpu"]
+    default_mode = "cpu"
     try:
         import torch
 
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            has_gpu = True
+            modes.append("gpu")
+            count = torch.cuda.device_count()
+            for idx in range(count):
+                modes.append(f"cuda:{idx}")
+            default_mode = "gpu"
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            has_gpu = True
+            modes.append("gpu")
+            modes.append("mps")
+            default_mode = "gpu"
     except Exception:
         pass
 
-    if has_gpu:
-        return ["cpu", "gpu"], "gpu"
-    return ["cpu"], "cpu"
+    return modes, default_mode
 
 
 class ModelRegistry:

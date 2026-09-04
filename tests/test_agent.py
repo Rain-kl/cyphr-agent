@@ -1005,4 +1005,114 @@ async def test_acquire_engine_exception_resilience() -> None:
     assert "faulty-model" not in registry.list_loaded_models()
 
 
+# =========================================================================
+# 9. P1 In-Memory Audio Pipeline & Multi-GPU Tests
+# =========================================================================
+
+def test_resolve_device_and_dtype_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.models.qwen3_asr import resolve_device_and_dtype
+    import torch
+
+    # 1. CPU explicit
+    dev, dtype, bs = resolve_device_and_dtype("cpu")
+    assert dev == "cpu"
+    assert dtype == torch.float32
+    assert bs == 1
+
+    # 2. Explicit QWEN3_ASR_DEVICE env
+    monkeypatch.setenv("QWEN3_ASR_DEVICE", "cpu")
+    dev, dtype, bs = resolve_device_and_dtype("gpu")
+    assert dev == "cpu"
+    monkeypatch.delenv("QWEN3_ASR_DEVICE")
+
+    # 3. CUDA fallback to CPU if torch.cuda not available
+    with patch("torch.cuda.is_available", return_value=False):
+        dev, dtype, bs = resolve_device_and_dtype("cuda:0")
+        assert dev == "cpu"
+        assert dtype == torch.float32
+
+    # 4. Multi-GPU device selection via CUDA_DEVICE_INDEX
+    with patch("torch.cuda.is_available", return_value=True), \
+         patch("torch.cuda.device_count", return_value=4), \
+         patch("torch.cuda.is_bf16_supported", return_value=True):
+        monkeypatch.setenv("CUDA_DEVICE_INDEX", "2")
+        dev, dtype, bs = resolve_device_and_dtype("gpu")
+        assert dev == "cuda:2"
+        assert dtype == torch.bfloat16
+        assert bs == 16
+
+
+def test_registry_multi_gpu_discovery() -> None:
+    from src.models.registry import detect_supported_modes
+
+    with patch("torch.cuda.is_available", return_value=True), \
+         patch("torch.cuda.device_count", return_value=3):
+        modes, default_mode = detect_supported_modes()
+        assert "cpu" in modes
+        assert "gpu" in modes
+        assert "cuda:0" in modes
+        assert "cuda:1" in modes
+        assert "cuda:2" in modes
+        assert default_mode == "gpu"
+
+
+def test_qwen3_asr_in_memory_ffmpeg_pipe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify non-standard audio uses in-memory pipe and never writes temporary wav files to disk."""
+    import subprocess
+    import numpy as np
+    from src.models.qwen3_asr import Qwen3ASREngine
+
+    engine = Qwen3ASREngine("qwen3-asr-0.6b")
+    engine.loaded = True
+
+    # Mock output object from qwen_asr model
+    mock_out = MagicMock()
+    mock_out.text = "In-memory streaming transcribed successfully"
+    mock_out.language = "en"
+
+    mock_model = MagicMock()
+    mock_model.transcribe.return_value = [mock_out]
+    engine._model = mock_model
+
+    test_mp3 = tmp_path / "stream_test.mp3"
+    test_mp3.write_bytes(b"dummy mp3 header and frames")
+
+    # Generate 1 second of fake 16kHz int16 PCM data
+    sample_rate = 16000
+    fake_pcm_samples = (np.sin(np.linspace(0, 2 * np.pi * 440, sample_rate)) * 16000).astype(np.int16)
+    fake_pcm_bytes = fake_pcm_samples.tobytes()
+
+    executed_cmd = []
+
+    def mock_subprocess_run(cmd, *args, **kwargs):
+        nonlocal executed_cmd
+        executed_cmd = cmd
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = fake_pcm_bytes
+        res.stderr = b""
+        return res
+
+    monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+
+    initial_files = list(tmp_path.glob("*.wav"))
+
+    result = engine.transcribe(str(test_mp3))
+
+    # Verify ffmpeg was invoked with stdout pipe
+    assert "-f" in executed_cmd
+    assert "s16le" in executed_cmd
+    assert "pipe:1" in executed_cmd
+    assert str(test_mp3) in executed_cmd
+
+    # Verify no temporary wav files were created on disk
+    after_files = list(tmp_path.glob("*.wav"))
+    assert len(after_files) == len(initial_files)
+
+    # Verify transcribed text
+    assert result["text"] == "In-memory streaming transcribed successfully"
+    assert result["language"] == "en"
+
+
+
 
