@@ -253,8 +253,6 @@ def resolve_model_dir(model_name: str = MODEL_NAME) -> Path:
 class Qwen3ASREngine(BaseEngine):
     """Qwen3-ASR local inference engine yielding OpenAI verbose_json."""
 
-    _inference_lock = threading.Lock()
-
     def __init__(
         self,
         model_name: str = MODEL_NAME,
@@ -265,6 +263,9 @@ class Qwen3ASREngine(BaseEngine):
         self.model_dir = Path(model_dir) if model_dir else resolve_model_dir(model_name)
         self.max_new_tokens = resolve_max_new_tokens(max_new_tokens)
         self._model = None
+        # Per-instance lock: replicas on different GPUs infer concurrently;
+        # same-replica jobs still serialize (transformers backend is not thread-safe).
+        self._inference_lock = threading.Lock()
 
     async def load(self, work_mode: str = "gpu") -> None:
         """Load weights (blocking torch work runs in executor via caller)."""

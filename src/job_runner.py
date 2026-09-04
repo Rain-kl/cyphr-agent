@@ -75,8 +75,16 @@ class CapacityController:
             return False
         return cpu < self.cpu_low and ram < self.ram_low and gpu < self.gpu_low
 
-    def update(self, stats: dict[str, Any], running_jobs: int) -> int:
+    def update(self, stats: dict[str, Any], running_jobs: int, queued: int = 0) -> int:
         """Evaluate one heartbeat sample; returns (possibly adjusted) capacity."""
+        if queued > 0:
+            # Inference serialization queue building up: never grow, shrink if persistent.
+            self._up_votes = 0
+            self._down_votes += 1
+            if self._down_votes >= 2:
+                self.capacity = max(self.min_capacity, self.capacity - 1)
+                self._down_votes = 0
+            return self.capacity
         if self._overloaded(stats):
             self._down_votes += 1
             self._up_votes = 0
@@ -186,16 +194,18 @@ class JobRunner:
             self._capacity_controller.capacity if max_concurrent_jobs == -1 else max_concurrent_jobs
         )
         self._semaphore = DynamicSemaphore(initial_sem)
-        # 按 model_name 细粒度串行：同模型推理排队，不同模型可并行。
-        # key 仅为已注册模型名（数量有界），不会随 job 增长而泄漏。
-        self._inference_locks: dict[str, asyncio.Lock] = {}
+        # 按 (model, device) 细粒度串行：同副本推理排队，不同副本（含多卡）可并行。
+        # key 仅为 (模型名, 设备) 二元组（数量有界），不会随 job 增长而泄漏。
+        self._inference_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._queued_inference = 0
         self._active_tasks: dict[int, asyncio.Task[None]] = {}
 
-    def _get_inference_lock(self, model_name: str) -> asyncio.Lock:
-        lock = self._inference_locks.get(model_name)
+    def _get_inference_lock(self, model_name: str, device: str) -> asyncio.Lock:
+        key = (model_name, device)
+        lock = self._inference_locks.get(key)
         if lock is None:
             lock = asyncio.Lock()
-            self._inference_locks[model_name] = lock
+            self._inference_locks[key] = lock
         return lock
 
     def get_running_jobs_count(self) -> int:
@@ -229,7 +239,7 @@ class JobRunner:
         """Refresh dynamic capacity from fresh monitor stats (heartbeat path)."""
         if not self.is_dynamic:
             return self.max_concurrent_jobs
-        capacity = self._capacity_controller.update(stats, self.get_running_jobs_count())
+        capacity = self._capacity_controller.update(stats, self.get_running_jobs_count(), self._queued_inference)
         self._semaphore.set_capacity(capacity)
         return capacity
 
@@ -292,8 +302,10 @@ class JobRunner:
                 await self.reporter.download_media(job_id, local_file_path)
 
                 # 3. Resolve and acquire model with lifecycle guard (ref counted, prevents hot-unload crash)
-                inference_lock = self._get_inference_lock(model_name)
-                async with self.registry.acquire_engine(model_name) as engine:
+                # Pick least-loaded replica first so multi-GPU nodes run jobs in parallel.
+                inference_device = self.registry.pick_inference_device(model_name)
+                inference_lock = self._get_inference_lock(model_name, inference_device)
+                async with self.registry.acquire_engine(model_name, device=inference_device) as engine:
                     # 4. Engine log callback (throttled: 同job间隔>=2s或progress增量>=10才上报)
                     _last_log_time = 0.0
                     _last_progress = -100
@@ -327,11 +339,18 @@ class JobRunner:
                             logs=[{
                                 "timestamp": datetime.now(UTC).isoformat(),
                                 "level": "info",
-                                "message": "Waiting for inference engine to become available...",
+                                "message": f"Waiting for inference engine to become available ({model_name}@{inference_device})...",
                             }],
                         )
 
-                    async with inference_lock:
+                    self._queued_inference += 1
+                    try:
+                        await inference_lock.acquire()
+                    except Exception:
+                        self._queued_inference -= 1
+                        raise
+                    self._queued_inference -= 1
+                    try:
                         if asyncio.iscoroutinefunction(engine.transcribe):
                             result = await engine.transcribe(
                                 audio_path=local_file_path,
@@ -362,6 +381,8 @@ class JobRunner:
                             # Drain any in-flight log callbacks with concurrent wait (bounded to 0.5s)
                             if pending_log_futures:
                                 concurrent.futures.wait(pending_log_futures, timeout=0.5)
+                    finally:
+                        inference_lock.release()
 
                 # 6. Settle completion
                 duration = time.time() - start_time

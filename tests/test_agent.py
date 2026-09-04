@@ -1839,6 +1839,123 @@ async def test_heartbeat_includes_advertised_capacity() -> None:
     assert payload["advertised_capacity"] == 3
 
 
+# =========================================================================
+# 12. Multi-replica parallel inference (TDD RED)
+# =========================================================================
+
+def test_pick_inference_device_prefers_idle_replica() -> None:
+    """Loaded replica with zero in-flight inferences wins over busy one."""
+    import asyncio
+
+    from src.models.mock_asr import MockASREngine
+    from src.models.registry import ModelRegistry
+
+    async def _scenario() -> None:
+        registry = ModelRegistry(preload_default=False)
+        registry.register("replica-model", lambda: MockASREngine("replica-model", stage_delay=0.0))
+        await registry.load_model("replica-model", device="cuda:0")
+        await registry.load_model("replica-model", device="cuda:1")
+        async with registry.acquire_engine("replica-model", device="cuda:0"):
+            picked = registry.pick_inference_device("replica-model")
+            assert picked == "cuda:1"
+
+    asyncio.run(_scenario())
+
+
+def test_pick_inference_device_unknown_model_resolves() -> None:
+    from src.models.registry import ModelRegistry
+
+    registry = ModelRegistry(preload_default=False)
+    # No loaded replica: falls back to normal device resolution (cpu here).
+    assert registry.pick_inference_device("never-loaded") == "cpu"
+
+
+def test_qwen_engine_locks_are_per_instance() -> None:
+    from src.models.qwen3_asr import Qwen3ASREngine
+
+    a = Qwen3ASREngine("qwen3-asr-0.6b")
+    b = Qwen3ASREngine("qwen3-asr-0.6b")
+    assert a._inference_lock is not b._inference_lock
+
+
+def test_inference_locks_are_per_device(tmp_path: Path) -> None:
+    from src.job_runner import JobRunner
+
+    runner = JobRunner(reporter=MagicMock(), registry=MagicMock(), media_dir=str(tmp_path))
+    assert runner._get_inference_lock("m", "cuda:0") is runner._get_inference_lock("m", "cuda:0")
+    assert runner._get_inference_lock("m", "cuda:0") is not runner._get_inference_lock("m", "cuda:1")
+
+
+def test_capacity_decreases_when_inference_queued() -> None:
+    from src.job_runner import CapacityController
+
+    c = CapacityController()
+    assert c.update(_low_stats(), running_jobs=3, queued=2) == 3
+    assert c.update(_low_stats(), running_jobs=3, queued=2) == 2
+
+
+def test_capacity_holds_without_queue_info_compat() -> None:
+    from src.job_runner import CapacityController
+
+    c = CapacityController()
+    # Old two-arg callables keep working (queued defaults to 0).
+    assert c.update(_low_stats(), running_jobs=1) == 3
+
+
+@pytest.mark.asyncio
+async def test_same_model_parallel_across_devices(tmp_path: Path) -> None:
+    """Same model on two replicas must infer concurrently (fails on per-model lock)."""
+    import asyncio
+    import time
+
+    import httpx
+
+    from src.job_runner import JobRunner
+    from src.models.base import BaseEngine
+    from src.models.registry import ModelRegistry
+    from src.reporter import Reporter
+
+    active = 0
+    max_active = 0
+
+    class TrackingAsyncEngine(BaseEngine):
+        def __init__(self) -> None:
+            super().__init__("dual-model")
+            self.loaded = True
+
+        async def load(self, work_mode: str = "gpu") -> None:
+            self.loaded = True
+
+        async def unload(self) -> None:
+            self.loaded = False
+
+        async def transcribe(self, audio_path: str, language=None, task_type="transcribe", log_callback=None):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.1)
+            active -= 1
+            return {"task": task_type, "language": "en", "duration": 1.0, "text": "ok", "segments": []}
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"AUDIO")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+    reporter = Reporter("http://test", "token", client=client)
+    registry = ModelRegistry(preload_default=False)
+    registry.register("dual-model", TrackingAsyncEngine)
+    await registry.load_model("dual-model", device="cuda:0")
+    await registry.load_model("dual-model", device="cuda:1")
+    runner = JobRunner(reporter=reporter, registry=registry, media_dir=str(tmp_path), max_concurrent_jobs=2)
+
+    t1 = runner.run_job({"job_id": 901, "model_name": "dual-model", "media_path": "x.mp3"})
+    t2 = runner.run_job({"job_id": 902, "model_name": "dual-model", "media_path": "x.mp3"})
+    await asyncio.gather(t1, t2)
+
+    assert max_active == 2
+    assert time.time() > 0  # wall clock sanity
+
+
 
 
 

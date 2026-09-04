@@ -292,6 +292,29 @@ class ModelRegistry:
         logger.info("Loaded model '%s' on %s (mode=%s)", model_name, device, self._current_mode)
         return engine
 
+    def inference_count(self, model_name: str, device: str) -> int:
+        """Return active inference count for a (model, device) replica."""
+        return self._inference_counts.get((model_name, _normalize_device(device)), 0)
+
+    def pick_inference_device(self, model_name: str) -> str:
+        """Choose which replica should serve the next inference.
+
+        Prefers a loaded idle replica (zero in-flight); otherwise falls back to
+        normal device resolution (may load a new replica on the least-loaded GPU
+        or reuse a busy one, which then queues on its per-replica lock).
+        """
+        best: str | None = None
+        best_count = 0
+        for key, engine in self._loaded_engines.items():
+            if not isinstance(key, tuple) or key[0] != model_name or not engine.loaded:
+                continue
+            count = self._inference_counts.get(key, 0)
+            if best is None or count < best_count:
+                best, best_count = key[1], count
+        if best is not None and best_count == 0:
+            return best
+        return self._resolve_device(None)
+
     @asynccontextmanager
     async def acquire_engine(self, model_name: str, device: str | None = None) -> AsyncIterator[BaseEngine]:
         """Safely acquire an engine instance for inference with active reference counting.
