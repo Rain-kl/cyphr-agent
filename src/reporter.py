@@ -1,7 +1,6 @@
 # Copyright 2026 Arctel.net
 # SPDX-License-Identifier: Apache-2.0
 
-import asyncio
 import logging
 import os
 from typing import Any
@@ -44,9 +43,8 @@ class Reporter:
         async with self.client.stream("GET", url) as resp:
             resp.raise_for_status()
             with open(target_path, "wb") as f:
-                async for chunk in resp.aiter_bytes(chunk_size=65536):
-                    if chunk:
-                        await asyncio.to_thread(f.write, chunk)
+                async for chunk in resp.aiter_bytes():
+                    f.write(chunk)
 
         logger.info("Downloaded media for job %d to %s", job_id, target_path)
         return target_path

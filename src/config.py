@@ -33,21 +33,8 @@ class AgentConfig(BaseModel):
     )
     max_concurrent_jobs: int = Field(
         default=2,
-        description="Maximum number of concurrently running transcription jobs (-1 = dynamic capacity)",
+        description="Maximum number of concurrently running transcription jobs",
     )
-    gpu_devices: str | None = Field(
-        default=None,
-        description="Comma-separated GPU device allowlist (e.g. 'cuda:0,cuda:1')",
-    )
-    max_concurrent_jobs_per_gpu: int = Field(
-        default=2,
-        description="Maximum number of concurrently running jobs per GPU",
-    )
-
-    @property
-    def is_dynamic(self) -> bool:
-        """Whether dynamic capacity advertisement mode is active (-1)."""
-        return self.max_concurrent_jobs == -1
 
     @property
     def http_base_url(self) -> str:
@@ -120,15 +107,6 @@ def load_config(config_path: str | Path | None = None) -> AgentConfig:
     if env_max_jobs := os.getenv("MAX_CONCURRENT_JOBS"):
         try:
             data["max_concurrent_jobs"] = int(env_max_jobs)
-        except ValueError:
-            pass
-    if env_gpu_devices := os.getenv("GPU_DEVICES"):
-        data["gpu_devices"] = env_gpu_devices
-    elif env_cuda_visible := os.getenv("CUDA_VISIBLE_DEVICES"):
-        data["gpu_devices"] = env_cuda_visible
-    if env_max_per_gpu := os.getenv("MAX_CONCURRENT_JOBS_PER_GPU"):
-        try:
-            data["max_concurrent_jobs_per_gpu"] = int(env_max_per_gpu)
         except ValueError:
             pass
 

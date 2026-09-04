@@ -37,21 +37,8 @@ class SystemMonitor:
             ram_used_mb = 0
             ram_total_mb = 0
 
-        # 3. GPU stats: single probe, then derive aggregate (keeps old fields compat)
-        try:
-            gpu_devices = self._collect_gpu_devices()
-        except Exception as e:
-            logger.warning("Failed to collect per-GPU stats: %s", e)
-            gpu_devices = []
-        if gpu_devices:
-            try:
-                gpu_percent = max(float(d.get("percent", 0.0)) for d in gpu_devices)
-                gpu_used_mb = sum(int(d.get("used_mb", 0)) for d in gpu_devices)
-                gpu_total_mb = sum(int(d.get("total_mb", 0)) for d in gpu_devices)
-            except Exception:
-                gpu_percent, gpu_used_mb, gpu_total_mb = self._collect_gpu()
-        else:
-            gpu_percent, gpu_used_mb, gpu_total_mb = 0.0, 0, 0
+        # 3. GPU stats (safe fallback to 0.0)
+        gpu_percent, gpu_used_mb, gpu_total_mb = self._collect_gpu()
 
         return {
             "cpu_percent": round(cpu_percent, 1),
@@ -61,66 +48,25 @@ class SystemMonitor:
             "gpu_percent": round(gpu_percent, 1),
             "gpu_memory_used_mb": gpu_used_mb,
             "gpu_memory_total_mb": gpu_total_mb,
-            "gpu_devices": gpu_devices,
         }
 
-    def _collect_gpu_devices(self) -> list[dict[str, Any]]:
-        """Probe every visible GPU; returns [{index, percent, used_mb, total_mb}]."""
-        devices: list[dict[str, Any]] = []
+    def _collect_gpu(self) -> tuple[float, int, int]:
+        """Safely probe GPU metrics without failing if GPU or drivers are missing."""
         try:
+            # First try pynvml if available
             import pynvml  # type: ignore
 
             pynvml.nvmlInit()
             device_count = pynvml.nvmlDeviceGetCount()
-            for idx in range(device_count):
-                try:
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
-                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    devices.append({
-                        "index": idx,
-                        "percent": float(util.gpu),
-                        "used_mb": int(mem_info.used // (1024 * 1024)),
-                        "total_mb": int(mem_info.total // (1024 * 1024)),
-                    })
-                except Exception:
-                    continue
-            if devices:
-                return devices
-        except Exception:
-            pass
-
-        try:
-            import torch  # type: ignore
-
-            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-                for idx in range(torch.cuda.device_count()):
-                    try:
-                        mem_allocated = torch.cuda.memory_allocated(idx) // (1024 * 1024)
-                        total_mem = torch.cuda.get_device_properties(idx).total_memory // (1024 * 1024)
-                    except Exception:
-                        continue
-                    devices.append({
-                        "index": idx,
-                        "percent": 0.0,
-                        "used_mb": int(mem_allocated),
-                        "total_mb": int(total_mem),
-                    })
-                return devices
-        except Exception:
-            pass
-
-        return []
-
-    def _collect_gpu(self) -> tuple[float, int, int]:
-        """Safely probe aggregate GPU metrics (max util, summed memory)."""
-        try:
-            devices = self._collect_gpu_devices()
-            if devices:
-                peak = max(float(d.get("percent", 0.0)) for d in devices)
-                used = sum(int(d.get("used_mb", 0)) for d in devices)
-                total = sum(int(d.get("total_mb", 0)) for d in devices)
-                return (peak, used, total)
+            if device_count > 0:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                return (
+                    float(util.gpu),
+                    int(mem_info.used // (1024 * 1024)),
+                    int(mem_info.total // (1024 * 1024)),
+                )
         except Exception:
             pass
 

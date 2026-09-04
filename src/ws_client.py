@@ -108,27 +108,14 @@ class AgentWebSocketClient:
         """Send a single heartbeat payload with hardware and model telemetry."""
         loaded = self.registry.list_loaded_models()
         downloaded = self.registry.list_downloaded_models()
-        try:
-            detailed = self.registry.list_loaded_models_detailed()
-        except AttributeError:
-            detailed = list(loaded)
-        system = self.monitor.collect()
-        gpu_devices = system.get("gpu_devices", [])
-        try:
-            advertised_capacity = int(self.job_runner.update_capacity(system))
-        except Exception:
-            advertised_capacity = self.job_runner.get_running_jobs_count()
         payload = {
             "models": loaded,
             "loaded_models": loaded,
-            "loaded_models_detailed": detailed,
             "downloaded_models": downloaded,
             "running_jobs": self.job_runner.get_running_jobs_count(),
-            "advertised_capacity": advertised_capacity,
             "supported_modes": self.registry.get_supported_modes(),
             "current_mode": self.registry.get_current_mode(),
-            "gpu_devices": gpu_devices,
-            "system": system,
+            "system": self.monitor.collect(),
         }
         heartbeat_msg = {
             "type": "heartbeat",
@@ -221,7 +208,7 @@ class AgentWebSocketClient:
 
         elif effective_action == "set_config":
             max_jobs = payload.get("max_concurrent_jobs")
-            if isinstance(max_jobs, int) and (max_jobs == -1 or max_jobs > 0):
+            if isinstance(max_jobs, int) and max_jobs > 0:
                 self.job_runner.set_max_concurrent_jobs(max_jobs)
             mode = payload.get("work_mode")
             if mode:

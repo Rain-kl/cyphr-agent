@@ -17,92 +17,6 @@ from .reporter import Reporter
 logger = logging.getLogger(__name__)
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except (ValueError, TypeError):
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except (ValueError, TypeError):
-        return default
-
-
-class CapacityController:
-    """AIMD dynamic concurrency for -1 (dynamic) mode.
-
-    Starts at 3, +1 only when saturated (running >= capacity) and load is low,
-    -1 whenever load is high. Direction changes require 2 consecutive heartbeats.
-    """
-
-    def __init__(
-        self,
-        initial: int | None = None,
-        min_capacity: int | None = None,
-        max_capacity: int | None = None,
-    ) -> None:
-        self.min_capacity = min_capacity if min_capacity is not None else _env_int("DYNAMIC_MIN_CAPACITY", 1)
-        self.max_capacity = max_capacity if max_capacity is not None else _env_int("DYNAMIC_MAX_CAPACITY", 8)
-        init = initial if initial is not None else _env_int("DYNAMIC_INITIAL_CAPACITY", 3)
-        self.capacity = max(self.min_capacity, min(self.max_capacity, init))
-        self.cpu_low = _env_float("DYNAMIC_CPU_LOW", 70.0)
-        self.cpu_high = _env_float("DYNAMIC_CPU_HIGH", 85.0)
-        self.ram_low = _env_float("DYNAMIC_RAM_LOW", 80.0)
-        self.ram_high = _env_float("DYNAMIC_RAM_HIGH", 90.0)
-        self.gpu_low = _env_float("DYNAMIC_GPU_LOW", 75.0)
-        self.gpu_high = _env_float("DYNAMIC_GPU_HIGH", 90.0)
-        self._up_votes = 0
-        self._down_votes = 0
-
-    def _overloaded(self, stats: dict[str, Any]) -> bool:
-        try:
-            cpu = float(stats.get("cpu_percent", 0.0))
-            ram = float(stats.get("ram_percent", 0.0))
-            gpu = float(stats.get("gpu_percent", 0.0))
-        except (ValueError, TypeError):
-            return False
-        return cpu > self.cpu_high or ram > self.ram_high or gpu > self.gpu_high
-
-    def _idle(self, stats: dict[str, Any]) -> bool:
-        try:
-            cpu = float(stats.get("cpu_percent", 0.0))
-            ram = float(stats.get("ram_percent", 0.0))
-            gpu = float(stats.get("gpu_percent", 0.0))
-        except (ValueError, TypeError):
-            return False
-        return cpu < self.cpu_low and ram < self.ram_low and gpu < self.gpu_low
-
-    def update(self, stats: dict[str, Any], running_jobs: int, queued: int = 0) -> int:
-        """Evaluate one heartbeat sample; returns (possibly adjusted) capacity."""
-        if queued > 0:
-            # Inference serialization queue building up: never grow, shrink if persistent.
-            self._up_votes = 0
-            self._down_votes += 1
-            if self._down_votes >= 2:
-                self.capacity = max(self.min_capacity, self.capacity - 1)
-                self._down_votes = 0
-            return self.capacity
-        if self._overloaded(stats):
-            self._down_votes += 1
-            self._up_votes = 0
-            if self._down_votes >= 2:
-                self.capacity = max(self.min_capacity, self.capacity - 1)
-                self._down_votes = 0
-        elif running_jobs >= self.capacity and self._idle(stats):
-            self._up_votes += 1
-            self._down_votes = 0
-            if self._up_votes >= 2:
-                self.capacity = min(self.max_capacity, self.capacity + 1)
-                self._up_votes = 0
-        else:
-            self._up_votes = 0
-            self._down_votes = 0
-        return self.capacity
-
-
 class DynamicSemaphore:
     """An asyncio semaphore that supports dynamic capacity changes without leaking permits."""
 
@@ -111,7 +25,6 @@ class DynamicSemaphore:
         self._acquired = 0
         self._cond = asyncio.Condition()
         self._bg_tasks: set[asyncio.Task[None]] = set()
-        self._notify_scheduled = False
 
     @property
     def capacity(self) -> int:
@@ -128,34 +41,11 @@ class DynamicSemaphore:
 
         try:
             loop = asyncio.get_running_loop()
+            task = loop.create_task(_notify())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
         except RuntimeError:
-            return
-        # 合并连续扩容/缩容的唤醒：若已有待执行 notify，直接复用，避免后台任务堆积泄漏。
-        self._bg_tasks = {t for t in self._bg_tasks if not t.done()}
-        if self._bg_tasks or self._notify_scheduled:
-            return
-        self._notify_scheduled = True
-        try:
-            # 线程安全地调度唤醒（set_capacity 可能被非事件循环线程调用）
-            loop.call_soon_threadsafe(lambda: self._schedule_notify(_notify))
-        except RuntimeError:
-            # 事件循环已关闭时静默跳过；等待者会在 acquire 轮询新 capacity 时自然通过
-            self._notify_scheduled = False
-            return
-
-    def _schedule_notify(self, coro_factory: Any) -> None:
-        self._notify_scheduled = False
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        # 二次合并：若回调排队期间已有 notify 任务在飞，则跳过新建
-        self._bg_tasks = {t for t in self._bg_tasks if not t.done()}
-        if self._bg_tasks:
-            return
-        task = loop.create_task(coro_factory())
-        self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+            pass
 
     async def acquire(self) -> None:
         async with self._cond:
@@ -189,59 +79,20 @@ class JobRunner:
         self.registry = registry
         self.media_dir = media_dir
         self.max_concurrent_jobs = max_concurrent_jobs
-        self._capacity_controller = CapacityController()
-        initial_sem = (
-            self._capacity_controller.capacity if max_concurrent_jobs == -1 else max_concurrent_jobs
-        )
-        self._semaphore = DynamicSemaphore(initial_sem)
-        # 按 (model, device) 细粒度串行：同副本推理排队，不同副本（含多卡）可并行。
-        # key 仅为 (模型名, 设备) 二元组（数量有界），不会随 job 增长而泄漏。
-        self._inference_locks: dict[tuple[str, str], asyncio.Lock] = {}
-        self._queued_inference = 0
+        self._semaphore = DynamicSemaphore(max_concurrent_jobs)
+        self._inference_lock = asyncio.Lock()
         self._active_tasks: dict[int, asyncio.Task[None]] = {}
-
-    def _get_inference_lock(self, model_name: str, device: str) -> asyncio.Lock:
-        key = (model_name, device)
-        lock = self._inference_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._inference_locks[key] = lock
-        return lock
 
     def get_running_jobs_count(self) -> int:
         """Return number of currently active jobs."""
         return len(self._active_tasks)
 
     def set_max_concurrent_jobs(self, limit: int) -> None:
-        """Update maximum concurrency limit dynamically (-1 enters dynamic mode)."""
-        if limit == -1 and not self.is_dynamic:
-            logger.info("Entering dynamic capacity mode (initial=%d)", self._capacity_controller.capacity)
-            self.max_concurrent_jobs = -1
-            self._semaphore.set_capacity(self._capacity_controller.capacity)
-        elif limit > 0 and limit != self.max_concurrent_jobs:
+        """Update maximum concurrency limit dynamically."""
+        if limit > 0 and limit != self.max_concurrent_jobs:
             logger.info("Updating max concurrent jobs from %d to %d", self.max_concurrent_jobs, limit)
             self.max_concurrent_jobs = limit
             self._semaphore.set_capacity(limit)
-
-    @property
-    def is_dynamic(self) -> bool:
-        """Whether dynamic capacity advertisement mode is active (-1)."""
-        return self.max_concurrent_jobs == -1
-
-    @property
-    def advertised_capacity(self) -> int:
-        """Capacity advertised to the controller via heartbeat."""
-        if self.is_dynamic:
-            return self._capacity_controller.capacity
-        return self.max_concurrent_jobs
-
-    def update_capacity(self, stats: dict[str, Any]) -> int:
-        """Refresh dynamic capacity from fresh monitor stats (heartbeat path)."""
-        if not self.is_dynamic:
-            return self.max_concurrent_jobs
-        capacity = self._capacity_controller.update(stats, self.get_running_jobs_count(), self._queued_inference)
-        self._semaphore.set_capacity(capacity)
-        return capacity
 
     def run_job(self, payload: dict[str, Any]) -> asyncio.Task[None]:
         """Dispatch a job asynchronously in the background.
@@ -302,21 +153,9 @@ class JobRunner:
                 await self.reporter.download_media(job_id, local_file_path)
 
                 # 3. Resolve and acquire model with lifecycle guard (ref counted, prevents hot-unload crash)
-                # Pick least-loaded replica first so multi-GPU nodes run jobs in parallel.
-                inference_device = self.registry.pick_inference_device(model_name)
-                inference_lock = self._get_inference_lock(model_name, inference_device)
-                async with self.registry.acquire_engine(model_name, device=inference_device) as engine:
-                    # 4. Engine log callback (throttled: 同job间隔>=2s或progress增量>=10才上报)
-                    _last_log_time = 0.0
-                    _last_progress = -100
-
+                async with self.registry.acquire_engine(model_name) as engine:
+                    # 4. Engine log callback
                     async def engine_log_cb(progress: int, message: str) -> None:
-                        nonlocal _last_log_time, _last_progress
-                        now = time.monotonic()
-                        is_first = _last_progress <= -100
-                        if not is_first and progress < 100:
-                            if (now - _last_log_time) < 2.0 and (progress - _last_progress) < 10:
-                                return
                         ts = datetime.now(UTC).isoformat()
                         try:
                             await self.reporter.report_logs(
@@ -326,31 +165,21 @@ class JobRunner:
                             )
                         except Exception as log_err:
                             logger.warning("Failed to report progress log: %s", log_err)
-                        else:
-                            _last_log_time = now
-                            _last_progress = progress
 
                     # 5. Perform inference with GIL protection for CPU-heavy / blocking tasks
                     loop = asyncio.get_running_loop()
-                    if inference_lock.locked():
+                    if self._inference_lock.locked():
                         await self.reporter.report_logs(
                             job_id=job_id,
                             progress=15,
                             logs=[{
                                 "timestamp": datetime.now(UTC).isoformat(),
                                 "level": "info",
-                                "message": f"Waiting for inference engine to become available ({model_name}@{inference_device})...",
+                                "message": "Waiting for inference engine to become available...",
                             }],
                         )
 
-                    self._queued_inference += 1
-                    try:
-                        await inference_lock.acquire()
-                    except Exception:
-                        self._queued_inference -= 1
-                        raise
-                    self._queued_inference -= 1
-                    try:
+                    async with self._inference_lock:
                         if asyncio.iscoroutinefunction(engine.transcribe):
                             result = await engine.transcribe(
                                 audio_path=local_file_path,
@@ -381,8 +210,6 @@ class JobRunner:
                             # Drain any in-flight log callbacks with concurrent wait (bounded to 0.5s)
                             if pending_log_futures:
                                 concurrent.futures.wait(pending_log_futures, timeout=0.5)
-                    finally:
-                        inference_lock.release()
 
                 # 6. Settle completion
                 duration = time.time() - start_time
