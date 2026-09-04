@@ -1,6 +1,6 @@
 controller_url: "http://localhost:8080"
 agent_token: "mock-agent-token"
 node_name: "agent-local"
-heartbeat_interval: 10
+heartbeat_interval: 5
 media_dir: "/tmp/transcribe/media"
 max_concurrent_jobs: 2
