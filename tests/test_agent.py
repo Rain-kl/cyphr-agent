@@ -682,3 +682,82 @@ def test_qwen3_asr_missing_ffmpeg_clear_error(tmp_path: Path, monkeypatch: pytes
 
     assert "ffmpeg" in str(exc_info.value)
     assert "cyphr 命令行客户端" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_jobs_inference_serialization(tmp_path: Path) -> None:
+    """Verify multiple concurrent jobs serialize their inference phase without collision."""
+    import time
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+
+    complete_data = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if "/media" in url_str:
+            return httpx.Response(200, content=b"RIFFdummyWAVdata")
+        if "/complete" in url_str:
+            complete_data.append(json.loads(request.content))
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(200, json={"status": "ok"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+    reporter = Reporter("http://test", "token", client=client)
+
+    active_inferences = 0
+    max_active_inferences = 0
+
+    class TrackingSyncEngine(BaseEngine):
+        def __init__(self) -> None:
+            super().__init__("tracking-engine")
+            self.loaded = True
+
+        async def load(self) -> None:
+            self.loaded = True
+
+        async def unload(self) -> None:
+            self.loaded = False
+
+        def transcribe(
+            self,
+            audio_path: str,
+            language: str | None = None,
+            task_type: str = "transcribe",
+            log_callback=None,
+        ) -> dict:
+            nonlocal active_inferences, max_active_inferences
+            active_inferences += 1
+            if active_inferences > max_active_inferences:
+                max_active_inferences = active_inferences
+            time.sleep(0.05)
+            active_inferences -= 1
+            return {
+                "task": task_type,
+                "language": language or "en",
+                "duration": 1.0,
+                "text": f"Transcribed {audio_path}",
+                "segments": [],
+            }
+
+    registry = ModelRegistry(preload_default=False)
+    registry.register("tracking-engine", TrackingSyncEngine)
+    await registry.load_model("tracking-engine")
+
+    runner = JobRunner(
+        reporter=reporter,
+        registry=registry,
+        media_dir=str(media_dir),
+        max_concurrent_jobs=3,
+    )
+
+    t1 = runner.run_job({"job_id": 101, "model_name": "tracking-engine", "media_path": "/api/v1/agent/jobs/101/media"})
+    t2 = runner.run_job({"job_id": 102, "model_name": "tracking-engine", "media_path": "/api/v1/agent/jobs/102/media"})
+    t3 = runner.run_job({"job_id": 103, "model_name": "tracking-engine", "media_path": "/api/v1/agent/jobs/103/media"})
+
+    await asyncio.gather(t1, t2, t3)
+
+    assert len(complete_data) == 3
+    # Max active inferences must be 1 because inference is serialized via _inference_lock
+    assert max_active_inferences == 1
+

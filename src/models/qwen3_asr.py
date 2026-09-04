@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,8 @@ def resolve_model_dir(model_name: str = MODEL_NAME) -> Path:
 
 class Qwen3ASREngine(BaseEngine):
     """Qwen3-ASR local inference engine yielding OpenAI verbose_json."""
+
+    _inference_lock = threading.Lock()
 
     def __init__(
         self,
@@ -288,36 +291,39 @@ class Qwen3ASREngine(BaseEngine):
         batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16" if torch.cuda.is_available() else "1"))
         batch_size = max(1, batch_size)
 
-        with torch.inference_mode():
-            for i in range(0, total, batch_size):
-                batch = chunks[i : i + batch_size]
-                cur_end = min(i + batch_size, total)
-                _log(50 + int(45 * cur_end / max(total, 1)), f"Running ASR batch inference ({cur_end}/{total})...")
+        _log(48, "Waiting for model inference slot...")
+        with self._inference_lock:
+            with torch.inference_mode():
+                for i in range(0, total, batch_size):
+                    batch = chunks[i : i + batch_size]
+                    cur_end = min(i + batch_size, total)
+                    _log(50 + int(45 * cur_end / max(total, 1)), f"Running ASR batch inference ({cur_end}/{total})...")
 
-                audio_inputs = [(cwav, SAMPLE_RATE) for cwav, _ in batch]
-                try:
-                    outs = self._model.transcribe(audio=audio_inputs, language=lang)
-                except Exception:
-                    outs = [
-                        self._model.transcribe(audio=(cwav, SAMPLE_RATE), language=lang)[0]
-                        for cwav, _ in batch
-                    ]
+                    audio_inputs = [(cwav, SAMPLE_RATE) for cwav, _ in batch]
+                    try:
+                        outs = self._model.transcribe(audio=audio_inputs, language=lang)
+                    except Exception as batch_err:
+                        logger.warning("Batch transcription failed, falling back to single-chunk: %s", batch_err)
+                        outs = [
+                            self._model.transcribe(audio=(cwav, SAMPLE_RATE), language=lang)[0]
+                            for cwav, _ in batch
+                        ]
 
-                for (cwav, offset), out in zip(batch, outs):
-                    text = (out.text or "").strip()
-                    if out.language and out.language not in langs:
-                        langs.append(out.language)
-                    if text:
-                        texts.append(text)
-                        segments.append(
-                            {
-                                "id": len(segments),
-                                "seek": int(offset * 100),
-                                "start": round(offset, 2),
-                                "end": round(offset + len(cwav) / SAMPLE_RATE, 2),
-                                "text": text,
-                            }
-                        )
+                    for (cwav, offset), out in zip(batch, outs):
+                        text = (out.text or "").strip()
+                        if out.language and out.language not in langs:
+                            langs.append(out.language)
+                        if text:
+                            texts.append(text)
+                            segments.append(
+                                {
+                                    "id": len(segments),
+                                    "seek": int(offset * 100),
+                                    "start": round(offset, 2),
+                                    "end": round(offset + len(cwav) / SAMPLE_RATE, 2),
+                                    "text": text,
+                                }
+                            )
         _log(100, "Aligning timestamps and finalizing transcript...")
         return {
             "task": task_type or "transcribe",

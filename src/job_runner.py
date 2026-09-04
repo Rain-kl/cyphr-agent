@@ -31,6 +31,7 @@ class JobRunner:
         self.media_dir = media_dir
         self.max_concurrent_jobs = max_concurrent_jobs
         self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
+        self._inference_lock = asyncio.Lock()
         self._active_tasks: dict[int, asyncio.Task[None]] = {}
 
     def get_running_jobs_count(self) -> int:
@@ -114,32 +115,44 @@ class JobRunner:
 
                 # 5. Perform inference with GIL protection for CPU-heavy / blocking tasks
                 loop = asyncio.get_running_loop()
-                if asyncio.iscoroutinefunction(engine.transcribe):
-                    result = await engine.transcribe(
-                        audio_path=local_file_path,
-                        language=language,
-                        task_type=task_type,
-                        log_callback=engine_log_cb,
+                if self._inference_lock.locked():
+                    await self.reporter.report_logs(
+                        job_id=job_id,
+                        progress=15,
+                        logs=[{
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "level": "info",
+                            "message": "Waiting for inference engine to become available...",
+                        }],
                     )
-                else:
-                    def sync_log_cb(p: int, msg: str) -> None:
-                        fut = asyncio.run_coroutine_threadsafe(
-                            engine_log_cb(p, msg),
-                            loop,
-                        )
-                        try:
-                            fut.result(timeout=5.0)
-                        except Exception as cb_err:
-                            logger.warning("Error in sync_log_cb: %s", cb_err)
 
-                    result = await loop.run_in_executor(
-                        None,
-                        engine.transcribe,
-                        local_file_path,
-                        language,
-                        task_type,
-                        sync_log_cb,
-                    )
+                async with self._inference_lock:
+                    if asyncio.iscoroutinefunction(engine.transcribe):
+                        result = await engine.transcribe(
+                            audio_path=local_file_path,
+                            language=language,
+                            task_type=task_type,
+                            log_callback=engine_log_cb,
+                        )
+                    else:
+                        def sync_log_cb(p: int, msg: str) -> None:
+                            fut = asyncio.run_coroutine_threadsafe(
+                                engine_log_cb(p, msg),
+                                loop,
+                            )
+                            try:
+                                fut.result(timeout=5.0)
+                            except Exception as cb_err:
+                                logger.warning("Error in sync_log_cb: %s", cb_err)
+
+                        result = await loop.run_in_executor(
+                            None,
+                            engine.transcribe,
+                            local_file_path,
+                            language,
+                            task_type,
+                            sync_log_cb,
+                        )
 
                 # 6. Settle completion
                 duration = time.time() - start_time
