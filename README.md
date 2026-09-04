@@ -66,3 +66,8 @@ uv run python main.py
 ```bash
 uv run pytest
 ```
+
+## Docs
+
+- 推理优化经验（P0/P1 实录与收益）：`docs/AGENT_INFERENCE_OPTIMIZATION.md`
+- 推理引擎编写指导规范（新引擎/改动必读）：`docs/AGENT_INFERENCE_ENGINE_GUIDE.md`
