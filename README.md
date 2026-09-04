@@ -9,7 +9,7 @@ Distributed Python asynchronous inference agent for the Transcribe platform.
 - **Concurrency & GIL protection**: Controlled concurrency with `asyncio.Semaphore` and threadpool executor offloading for CPU-heavy / blocking inference tasks.
 - **Global exception shielding**: Any task failure is reported to the controller (`status="failed"`) without terminating the agent process.
 - **OpenAI-compatible format**: ASR engines output OpenAI `verbose_json` compliant responses.
-- **Mock ASR Engine**: Multi-stage progress simulation (20%, 50%, 80%, 100%) for testing and lightweight deployments.
+- **Mock ASR Engine**: Multi-stage progress simulation (20%, 30%, 80%, 100%) for testing and lightweight deployments.
 
 ## Quick Start
 

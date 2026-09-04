@@ -136,7 +136,7 @@ async def test_mock_asr_engine_transcribe_and_progress(tmp_path: Path) -> None:
 
     # Validate progress callbacks
     progress_values = [p[0] for p in reported_progress]
-    assert progress_values == [20, 50, 80, 100]
+    assert progress_values == [20, 30, 80, 100]
 
     # Validate OpenAI verbose_json compliant structure
     assert res["task"] == "transcribe"

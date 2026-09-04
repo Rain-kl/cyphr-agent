@@ -273,7 +273,7 @@ class Qwen3ASREngine(BaseEngine):
             is_standard_audio = False
 
         if is_standard_audio:
-            _log(50, "Direct audio feed detected (standard 16kHz mono audio), skipping ffmpeg conversion...")
+            _log(30, "Direct audio feed detected (standard 16kHz mono audio), skipping ffmpeg conversion...")
             wav = normalize_audio_input(audio_path)
             chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
         else:
@@ -302,7 +302,7 @@ class Qwen3ASREngine(BaseEngine):
                 if r.returncode != 0:
                     err_msg = r.stderr.decode("utf-8", errors="replace").strip() if r.stderr else "unknown error"
                     raise RuntimeError(f"ffmpeg failed for {audio_path}: {err_msg}")
-                _log(50, "Preprocessing audio chunks and extracting features...")
+                _log(30, "Preprocessing audio chunks and extracting features...")
                 pcm_data = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
                 wav = normalize_audio_input((pcm_data, TARGET_SR))
                 chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
@@ -320,13 +320,13 @@ class Qwen3ASREngine(BaseEngine):
         batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16" if torch.cuda.is_available() else "1"))
         batch_size = max(1, batch_size)
 
-        _log(48, "Waiting for model inference slot...")
+        _log(30, "Waiting for model inference slot...")
         with self._inference_lock:
             with torch.inference_mode():
                 for i in range(0, total, batch_size):
                     batch = chunks[i : i + batch_size]
                     cur_end = min(i + batch_size, total)
-                    _log(50 + int(45 * cur_end / max(total, 1)), f"Running ASR batch inference ({cur_end}/{total})...")
+                    _log(30 + int(65 * cur_end / max(total, 1)), f"Running ASR batch inference ({cur_end}/{total})...")
 
                     audio_inputs = [(cwav, SAMPLE_RATE) for cwav, _ in batch]
                     try:

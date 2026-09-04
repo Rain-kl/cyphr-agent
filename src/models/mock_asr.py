@@ -44,7 +44,7 @@ class MockASREngine(BaseEngine):
 
         Stages:
         - 20%: Loading audio file
-        - 50%: Preprocessing audio chunks
+        - 30%: Preprocessing audio chunks
         - 80%: Running acoustic model inference
         - 100%: Aligning timestamps and generating verbose_json transcript
         """
@@ -56,7 +56,7 @@ class MockASREngine(BaseEngine):
 
         stages = [
             (20, "Loading and decoding audio file..."),
-            (50, "Preprocessing audio chunks and extracting features..."),
+            (30, "Preprocessing audio chunks and extracting features..."),
             (80, "Running acoustic model inference..."),
             (100, "Aligning timestamps and finalizing transcript..."),
         ]
