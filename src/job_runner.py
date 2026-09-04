@@ -17,6 +17,84 @@ from .reporter import Reporter
 logger = logging.getLogger(__name__)
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+class CapacityController:
+    """AIMD dynamic concurrency for -1 (dynamic) mode.
+
+    Starts at 3, +1 only when saturated (running >= capacity) and load is low,
+    -1 whenever load is high. Direction changes require 2 consecutive heartbeats.
+    """
+
+    def __init__(
+        self,
+        initial: int | None = None,
+        min_capacity: int | None = None,
+        max_capacity: int | None = None,
+    ) -> None:
+        self.min_capacity = min_capacity if min_capacity is not None else _env_int("DYNAMIC_MIN_CAPACITY", 1)
+        self.max_capacity = max_capacity if max_capacity is not None else _env_int("DYNAMIC_MAX_CAPACITY", 8)
+        init = initial if initial is not None else _env_int("DYNAMIC_INITIAL_CAPACITY", 3)
+        self.capacity = max(self.min_capacity, min(self.max_capacity, init))
+        self.cpu_low = _env_float("DYNAMIC_CPU_LOW", 70.0)
+        self.cpu_high = _env_float("DYNAMIC_CPU_HIGH", 85.0)
+        self.ram_low = _env_float("DYNAMIC_RAM_LOW", 80.0)
+        self.ram_high = _env_float("DYNAMIC_RAM_HIGH", 90.0)
+        self.gpu_low = _env_float("DYNAMIC_GPU_LOW", 75.0)
+        self.gpu_high = _env_float("DYNAMIC_GPU_HIGH", 90.0)
+        self._up_votes = 0
+        self._down_votes = 0
+
+    def _overloaded(self, stats: dict[str, Any]) -> bool:
+        try:
+            cpu = float(stats.get("cpu_percent", 0.0))
+            ram = float(stats.get("ram_percent", 0.0))
+            gpu = float(stats.get("gpu_percent", 0.0))
+        except (ValueError, TypeError):
+            return False
+        return cpu > self.cpu_high or ram > self.ram_high or gpu > self.gpu_high
+
+    def _idle(self, stats: dict[str, Any]) -> bool:
+        try:
+            cpu = float(stats.get("cpu_percent", 0.0))
+            ram = float(stats.get("ram_percent", 0.0))
+            gpu = float(stats.get("gpu_percent", 0.0))
+        except (ValueError, TypeError):
+            return False
+        return cpu < self.cpu_low and ram < self.ram_low and gpu < self.gpu_low
+
+    def update(self, stats: dict[str, Any], running_jobs: int) -> int:
+        """Evaluate one heartbeat sample; returns (possibly adjusted) capacity."""
+        if self._overloaded(stats):
+            self._down_votes += 1
+            self._up_votes = 0
+            if self._down_votes >= 2:
+                self.capacity = max(self.min_capacity, self.capacity - 1)
+                self._down_votes = 0
+        elif running_jobs >= self.capacity and self._idle(stats):
+            self._up_votes += 1
+            self._down_votes = 0
+            if self._up_votes >= 2:
+                self.capacity = min(self.max_capacity, self.capacity + 1)
+                self._up_votes = 0
+        else:
+            self._up_votes = 0
+            self._down_votes = 0
+        return self.capacity
+
+
 class DynamicSemaphore:
     """An asyncio semaphore that supports dynamic capacity changes without leaking permits."""
 
@@ -103,7 +181,11 @@ class JobRunner:
         self.registry = registry
         self.media_dir = media_dir
         self.max_concurrent_jobs = max_concurrent_jobs
-        self._semaphore = DynamicSemaphore(max_concurrent_jobs)
+        self._capacity_controller = CapacityController()
+        initial_sem = (
+            self._capacity_controller.capacity if max_concurrent_jobs == -1 else max_concurrent_jobs
+        )
+        self._semaphore = DynamicSemaphore(initial_sem)
         # 按 model_name 细粒度串行：同模型推理排队，不同模型可并行。
         # key 仅为已注册模型名（数量有界），不会随 job 增长而泄漏。
         self._inference_locks: dict[str, asyncio.Lock] = {}
@@ -121,11 +203,35 @@ class JobRunner:
         return len(self._active_tasks)
 
     def set_max_concurrent_jobs(self, limit: int) -> None:
-        """Update maximum concurrency limit dynamically."""
-        if limit > 0 and limit != self.max_concurrent_jobs:
+        """Update maximum concurrency limit dynamically (-1 enters dynamic mode)."""
+        if limit == -1 and not self.is_dynamic:
+            logger.info("Entering dynamic capacity mode (initial=%d)", self._capacity_controller.capacity)
+            self.max_concurrent_jobs = -1
+            self._semaphore.set_capacity(self._capacity_controller.capacity)
+        elif limit > 0 and limit != self.max_concurrent_jobs:
             logger.info("Updating max concurrent jobs from %d to %d", self.max_concurrent_jobs, limit)
             self.max_concurrent_jobs = limit
             self._semaphore.set_capacity(limit)
+
+    @property
+    def is_dynamic(self) -> bool:
+        """Whether dynamic capacity advertisement mode is active (-1)."""
+        return self.max_concurrent_jobs == -1
+
+    @property
+    def advertised_capacity(self) -> int:
+        """Capacity advertised to the controller via heartbeat."""
+        if self.is_dynamic:
+            return self._capacity_controller.capacity
+        return self.max_concurrent_jobs
+
+    def update_capacity(self, stats: dict[str, Any]) -> int:
+        """Refresh dynamic capacity from fresh monitor stats (heartbeat path)."""
+        if not self.is_dynamic:
+            return self.max_concurrent_jobs
+        capacity = self._capacity_controller.update(stats, self.get_running_jobs_count())
+        self._semaphore.set_capacity(capacity)
+        return capacity
 
     def run_job(self, payload: dict[str, Any]) -> asyncio.Task[None]:
         """Dispatch a job asynchronously in the background.

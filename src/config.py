@@ -33,7 +33,7 @@ class AgentConfig(BaseModel):
     )
     max_concurrent_jobs: int = Field(
         default=2,
-        description="Maximum number of concurrently running transcription jobs",
+        description="Maximum number of concurrently running transcription jobs (-1 = dynamic capacity)",
     )
     gpu_devices: str | None = Field(
         default=None,
@@ -43,6 +43,11 @@ class AgentConfig(BaseModel):
         default=2,
         description="Maximum number of concurrently running jobs per GPU",
     )
+
+    @property
+    def is_dynamic(self) -> bool:
+        """Whether dynamic capacity advertisement mode is active (-1)."""
+        return self.max_concurrent_jobs == -1
 
     @property
     def http_base_url(self) -> str:

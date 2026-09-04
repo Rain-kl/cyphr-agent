@@ -1711,6 +1711,134 @@ def test_qwen3_asr_b3_flac_fastpath_no_ffmpeg(tmp_path: Path, monkeypatch: pytes
     assert result["text"] == "flac ok"
 
 
+# =========================================================================
+# 11. Dynamic capacity advertisement (TDD RED)
+# =========================================================================
+
+def _low_stats() -> dict:
+    return {
+        "cpu_percent": 10.0,
+        "ram_percent": 20.0,
+        "ram_used_mb": 100,
+        "ram_total_mb": 1000,
+        "gpu_percent": 5.0,
+        "gpu_memory_used_mb": 100,
+        "gpu_memory_total_mb": 8000,
+        "gpu_devices": [],
+    }
+
+
+def _high_stats() -> dict:
+    return {
+        "cpu_percent": 95.0,
+        "ram_percent": 95.0,
+        "ram_used_mb": 950,
+        "ram_total_mb": 1000,
+        "gpu_percent": 99.0,
+        "gpu_memory_used_mb": 7900,
+        "gpu_memory_total_mb": 8000,
+        "gpu_devices": [],
+    }
+
+
+def test_capacity_controller_starts_at_3() -> None:
+    from src.job_runner import CapacityController
+
+    c = CapacityController()
+    assert c.capacity == 3
+
+
+def test_capacity_controller_increases_when_saturated_and_idle() -> None:
+    from src.job_runner import CapacityController
+
+    c = CapacityController()
+    # running == capacity (3/3) 且低负载，需连续2次才+1（防抖）
+    assert c.update(_low_stats(), running_jobs=3) == 3
+    assert c.update(_low_stats(), running_jobs=3) == 4
+
+
+def test_capacity_controller_holds_when_unsaturated() -> None:
+    from src.job_runner import CapacityController
+
+    c = CapacityController()
+    assert c.update(_low_stats(), running_jobs=1) == 3
+    assert c.update(_low_stats(), running_jobs=1) == 3
+
+
+def test_capacity_controller_decreases_on_high_load() -> None:
+    from src.job_runner import CapacityController
+
+    c = CapacityController()
+    assert c.update(_high_stats(), running_jobs=3) == 3
+    assert c.update(_high_stats(), running_jobs=3) == 2
+
+
+def test_capacity_controller_clamps_min_max() -> None:
+    from src.job_runner import CapacityController
+
+    c = CapacityController(initial=8, min_capacity=1, max_capacity=8)
+    for _ in range(6):
+        c.update(_low_stats(), running_jobs=c.capacity)
+    assert c.capacity == 8
+    c2 = CapacityController(initial=1, min_capacity=1, max_capacity=8)
+    for _ in range(6):
+        c2.update(_high_stats(), running_jobs=1)
+    assert c2.capacity == 1
+
+
+def test_job_runner_dynamic_mode_reports_capacity(tmp_path: Path) -> None:
+    from src.job_runner import JobRunner
+
+    reporter = MagicMock()
+    registry = MagicMock()
+    runner = JobRunner(
+        reporter=reporter,
+        registry=registry,
+        media_dir=str(tmp_path),
+        max_concurrent_jobs=-1,
+    )
+    assert runner.is_dynamic is True
+    assert runner.advertised_capacity == 3
+
+
+def test_job_runner_static_mode_ignores_capacity(tmp_path: Path) -> None:
+    from src.job_runner import JobRunner
+
+    reporter = MagicMock()
+    registry = MagicMock()
+    runner = JobRunner(
+        reporter=reporter,
+        registry=registry,
+        media_dir=str(tmp_path),
+        max_concurrent_jobs=2,
+    )
+    assert runner.is_dynamic is False
+    assert runner.advertised_capacity == 2
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_includes_advertised_capacity() -> None:
+    import json
+
+    from src.config import AgentConfig
+    from src.job_runner import JobRunner
+    from src.monitor import SystemMonitor
+    from src.models.registry import ModelRegistry
+    from src.ws_client import AgentWebSocketClient
+
+    config = AgentConfig(max_concurrent_jobs=-1)
+    monitor = SystemMonitor()
+    registry = ModelRegistry(preload_default=False)
+    reporter = MagicMock()
+    runner = JobRunner(reporter=reporter, registry=registry, media_dir="/tmp/x", max_concurrent_jobs=-1)
+    client = AgentWebSocketClient(config, monitor, registry, runner)
+
+    mock_ws = AsyncMock()
+    await client._send_heartbeat(mock_ws)
+    payload = json.loads(mock_ws.send.call_args[0][0])["payload"]
+    assert payload["advertised_capacity"] == 3
+
+
 
 
 
