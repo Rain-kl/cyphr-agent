@@ -262,18 +262,18 @@ class Qwen3ASREngine(BaseEngine):
                 logger.warning("log_callback failed: %s", e)
 
         _log(20, "Loading and decoding audio file...")
-        # Check if incoming audio is already a standard 16kHz mono WAV to avoid redundant conversion
-        is_standard_wav = False
+        # Check if incoming audio is already a standard 16kHz mono audio (WAV or MP3) to avoid redundant conversion
+        is_standard_audio = False
         try:
             import soundfile as sf
             with sf.SoundFile(audio_path) as info:
-                if info.format == "WAV" and info.samplerate == TARGET_SR and info.channels == 1:
-                    is_standard_wav = True
+                if info.samplerate == TARGET_SR and info.channels == 1 and info.format in ("WAV", "MP3"):
+                    is_standard_audio = True
         except Exception:
-            is_standard_wav = False
+            is_standard_audio = False
 
-        if is_standard_wav:
-            _log(50, "Direct audio feed detected (standard 16kHz mono WAV), skipping ffmpeg conversion...")
+        if is_standard_audio:
+            _log(50, "Direct audio feed detected (standard 16kHz mono audio), skipping ffmpeg conversion...")
             wav = normalize_audio_input(audio_path)
             chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
         else:
