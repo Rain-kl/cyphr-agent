@@ -31,16 +31,52 @@ CYAN="\033[36m"
 BOLD="\033[1m"
 RESET="\033[0m"
 
-# 获取运行命令
-get_run_cmd() {
-    if command -v uv >/dev/null 2>&1; then
-        echo "uv run python main.py"
-    elif [ -f "${SCRIPT_DIR}/.venv/bin/python" ]; then
-        echo "${SCRIPT_DIR}/.venv/bin/python main.py"
+# 获取可用的 Python 执行环境
+get_python_bin() {
+    if [ -x "${SCRIPT_DIR}/.venv/bin/python" ]; then
+        echo "${SCRIPT_DIR}/.venv/bin/python"
     elif command -v python3 >/dev/null 2>&1; then
-        echo "python3 main.py"
+        echo "python3"
+    elif command -v python >/dev/null 2>&1; then
+        echo "python"
     else
-        echo "python main.py"
+        echo ""
+    fi
+}
+
+# 真正的后台守护进程化启动函数 (通过 os.setsid 创建独立 session & process group，重定向 stdin，忽略 SIGHUP)
+# 彻底防止因退出脚本或关闭终端导致后台服务和下载任务被终止
+daemonize_cmd() {
+    local log_file="$1"
+    shift
+    local py_bin
+    py_bin=$(get_python_bin)
+
+    if [ -n "$py_bin" ]; then
+        "$py_bin" -c '
+import subprocess, sys, os, signal
+log_file = sys.argv[1]
+cmd = sys.argv[2:]
+def preexec():
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+with open(log_file, "a", buffering=1) as f:
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=f,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+        preexec_fn=preexec,
+    )
+    print(proc.pid)
+' "$log_file" "$@"
+    else
+        # 兜底：若系统无 python，尝试使用 nohup + 重定向 stdin + disown
+        nohup "$@" < /dev/null >> "$log_file" 2>&1 &
+        local p=$!
+        disown "$p" 2>/dev/null || true
+        echo "$p"
     fi
 }
 
@@ -111,12 +147,20 @@ start_service() {
     # 清理残留的无效 PID 文件
     [ -f "$PID_FILE" ] && /bin/rm -f "$PID_FILE"
 
-    local run_cmd
-    run_cmd=$(get_run_cmd)
+    local py_bin
+    py_bin=$(get_python_bin)
+    if [ -z "$py_bin" ]; then
+        echo -e "${RED}✗ 未找到可用的 Python 解释器。${RESET}"
+        return 1
+    fi
 
-    # 后台启动进程并将输出追加重定向至日志文件
-    nohup $run_cmd >> "$LOG_FILE" 2>&1 &
-    local new_pid=$!
+    # 后台以守护进程方式启动 (独立 session，不随终端关闭/退出而退出)
+    local new_pid
+    new_pid=$(daemonize_cmd "$LOG_FILE" "$py_bin" "${SCRIPT_DIR}/main.py")
+    if [ -z "$new_pid" ]; then
+        echo -e "${RED}✗ 启动守护进程失败。${RESET}"
+        return 1
+    fi
     echo "$new_pid" > "$PID_FILE"
 
     # 等待 1.5 秒确认进程是否稳定存活
@@ -283,10 +327,15 @@ EOF
         echo -e "  存储目录: ${BOLD}models/${pkg_dir}${RESET}"
         echo -e "  下载源  : ${endpoint}"
 
-        # 启动后台任务 (设置 PYTHONUNBUFFERED=1 确保进度实时写入日志)
-        nohup env HF_ENDPOINT="$endpoint" PYTHONUNBUFFERED=1 \
-            "${SCRIPT_DIR}/scripts/download_model.sh" "$model_id" "$pkg_dir" >> "$DOWNLOAD_LOG_FILE" 2>&1 &
-        local new_pid=$!
+        # 启动后台任务 (设置 PYTHONUNBUFFERED=1 确保进度实时写入日志，使用 daemonize_cmd 独立 session)
+        local new_pid
+        new_pid=$(daemonize_cmd "$DOWNLOAD_LOG_FILE" \
+            env HF_ENDPOINT="$endpoint" PYTHONUNBUFFERED=1 \
+            "${SCRIPT_DIR}/scripts/download_model.sh" "$model_id" "$pkg_dir")
+        if [ -z "$new_pid" ]; then
+            echo -e "${RED}✗ 下载任务启动失败，无法拉起守护进程。${RESET}"
+            return 1
+        fi
         echo "$new_pid" > "$DOWNLOAD_PID_FILE"
 
         sleep 1
@@ -512,15 +561,20 @@ stop_download() {
         model_id=$(grep '^MODEL_ID=' "$DOWNLOAD_INFO_FILE" | cut -d'=' -f2-)
     fi
 
-    read -r -p "确认停止模型 [${model_id}] 的后台下载 (PID: ${pid})? [y/N]: " confirm
-    case "$confirm" in
-        [yY][eE][sS]|[yY])
-            ;;
-        *)
-            echo -e "${YELLOW}已取消操作。${RESET}"
-            return 0
-            ;;
-    esac
+    local force="${1:-}"
+    if [ "$force" != "-y" ] && [ "$force" != "--yes" ]; then
+        if [ -t 0 ]; then
+            read -r -p "确认停止模型 [${model_id}] 的后台下载 (PID: ${pid})? [y/N]: " confirm
+            case "$confirm" in
+                [yY][eE][sS]|[yY])
+                    ;;
+                *)
+                    echo -e "${YELLOW}已取消操作。${RESET}"
+                    return 0
+                    ;;
+            esac
+        fi
+    fi
 
     echo "正在向下载进程 (PID: ${pid}) 发送优雅终止信号 (SIGINT)..."
     kill -INT "$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
@@ -546,6 +600,7 @@ stop_download() {
 
 # 交互式菜单逻辑
 interactive_menu() {
+    trap 'echo -e "\n${GREEN}已退出管理面板。${RESET}"; exit 0' INT
     PS3="请选择操作编号: "
     options=(
         "启动服务"
@@ -561,6 +616,10 @@ interactive_menu() {
     while true; do
         echo -e "\n${BOLD}=== Cyphr Agent 管理面板 ===${RESET}"
         select opt in "${options[@]}"; do
+            if [ -z "$REPLY" ]; then
+                echo -e "\n${GREEN}再见！${RESET}"
+                exit 0
+            fi
             case $REPLY in
                 1)
                     start_service
@@ -632,7 +691,7 @@ case "${1:-}" in
         view_download_progress
         ;;
     stop-download)
-        stop_download
+        stop_download "${2:-}"
         ;;
     models)
         echo -e "${CYAN}=== 本地已安装模型列表 ===${RESET}"

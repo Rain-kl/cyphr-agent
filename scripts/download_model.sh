@@ -37,5 +37,4 @@ if ! command -v python3 &>/dev/null; then
 fi
 
 mkdir -p "$DEST"
-$PYTHON_BIN "$ROOT/scripts/download_model.py" --model-id "$MODEL_ID" --dest "$DEST" "$@"
-echo "Saved $MODEL_ID -> $DEST"
+exec $PYTHON_BIN "$ROOT/scripts/download_model.py" --model-id "$MODEL_ID" --dest "$DEST" "$@"
