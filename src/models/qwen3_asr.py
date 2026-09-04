@@ -113,7 +113,7 @@ class Qwen3ASREngine(BaseEngine):
         else:
             raise FileNotFoundError(
                 f"Model package missing in {self.model_dir}. "
-                f"Please run './scripts/download_model.sh {self.model_name}' first."
+                f"Please download model '{self.model_name}' first using cyphr-installer."
             )
 
         if work_mode == "cpu":

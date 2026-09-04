@@ -34,25 +34,25 @@ Configuration is loaded from `config.yaml` or overridden by environment variable
 
 ### Running
 
-#### Interactive Service Management (Recommended)
+#### Service Management via Cyphr Installer (Recommended)
 
-Use the interactive management script:
+Use `cyphr-installer` for full lifecycle management (start/stop/status/restart/download/update):
 
 ```bash
-./agent.sh
+cyphr-installer
 ```
 
 Or pass commands directly:
 
 ```bash
-./agent.sh start         # Start service in background
-./agent.sh stop          # Stop running service
-./agent.sh status        # Check status, models, and recent logs
-./agent.sh restart       # Restart service
-./agent.sh download      # Interactively choose and download models (supports background & resume)
-./agent.sh progress      # View model download progress and live logs
-./agent.sh stop-download # Stop running model download task
-./agent.sh models        # List local downloaded models
+cyphr-installer start         # Start agent service in background
+cyphr-installer stop          # Stop running service
+cyphr-installer status        # Check status, models, and recent logs
+cyphr-installer restart       # Restart service
+cyphr-installer download      # Interactively choose and download models
+cyphr-installer progress      # View model download progress and live logs
+cyphr-installer stop-download # Stop running model download task
+cyphr-installer models        # List local downloaded models
 ```
 
 #### Manual Run
