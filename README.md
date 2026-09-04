@@ -45,10 +45,14 @@ Use the interactive management script:
 Or pass commands directly:
 
 ```bash
-./agent.sh start    # Start service in background
-./agent.sh stop     # Stop running service
-./agent.sh status   # Check status and recent logs
-./agent.sh restart  # Restart service
+./agent.sh start         # Start service in background
+./agent.sh stop          # Stop running service
+./agent.sh status        # Check status, models, and recent logs
+./agent.sh restart       # Restart service
+./agent.sh download      # Interactively choose and download models (supports background & resume)
+./agent.sh progress      # View model download progress and live logs
+./agent.sh stop-download # Stop running model download task
+./agent.sh models        # List local downloaded models
 ```
 
 #### Manual Run
