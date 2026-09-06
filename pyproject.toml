@@ -1,7 +1,7 @@
 [project]
-name = "transcribe-agent"
+name = "cyphr-agent"
 version = "0.1.0"
-description = "Transcribe distributed worker agent"
+description = "Distributed Python inference agent for Cyphr transcription platform"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

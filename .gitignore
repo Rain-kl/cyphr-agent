@@ -3,8 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-# Allow agent config.yaml
-!config.yaml
+# Local configuration & downloaded models
+config.yaml
+models/
+models/*
 
 
 # C extensions
