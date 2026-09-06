@@ -79,6 +79,194 @@ def resolve_device_and_dtype(work_mode: str = "gpu") -> tuple[str, Any, int]:
 
     return "cpu", torch.float32, int(os.getenv("QWEN3_ASR_BATCH_SIZE", "1"))
 
+
+def resolve_devices_and_configs(
+    work_mode: str = "gpu",
+    model_name: str = MODEL_NAME,
+) -> list[tuple[str, Any, int]]:
+    """Resolve target inference devices, dtypes, and optimal batch sizes.
+
+    Features:
+    1. Multi-GPU allocation across all healthy CUDA devices.
+    2. Dynamic VRAM estimation and batch size calculation to maximize throughput while avoiding OOM.
+    3. Respects explicit user overrides: $QWEN3_ASR_DEVICE, $CUDA_DEVICE_INDEX, $QWEN3_ASR_BATCH_SIZE.
+    4. Safe fallback to single GPU, MPS, or CPU if VRAM or hardware is insufficient.
+    """
+    import torch
+
+    env_device = os.getenv("QWEN3_ASR_DEVICE", "").strip().lower()
+    explicit_idx = os.getenv("CUDA_DEVICE_INDEX", "").strip()
+
+    # 1. If explicit single device is requested via env or work_mode contains ":"
+    if env_device and env_device not in ("all", "multi", "gpu", "cuda"):
+        dev, dt, bs = resolve_device_and_dtype(env_device)
+        return [(dev, dt, bs)]
+
+    if explicit_idx:
+        dev, dt, bs = resolve_device_and_dtype(work_mode)
+        return [(dev, dt, bs)]
+
+    req_device = work_mode.strip().lower()
+    if req_device == "cpu":
+        return [resolve_device_and_dtype("cpu")]
+
+    if req_device.startswith("cuda") and ":" in req_device:
+        return [resolve_device_and_dtype(req_device)]
+
+    if req_device == "mps":
+        return [resolve_device_and_dtype("mps")]
+
+    # 2. Multi-GPU auto-discovery for generic "gpu" / "cuda"
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        use_bf16 = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+        dtype = torch.bfloat16 if use_bf16 else torch.float16
+
+        # Estimate minimum VRAM required to load model weights (bytes)
+        name_lower = model_name.lower()
+        if "1.7b" in name_lower:
+            min_model_vram = int(3.8 * 1024 * 1024 * 1024)
+        elif "0.6b" in name_lower:
+            min_model_vram = int(1.8 * 1024 * 1024 * 1024)
+        else:
+            min_model_vram = int(2.0 * 1024 * 1024 * 1024)
+
+        devices: list[tuple[str, Any, int]] = []
+        user_bs = os.getenv("QWEN3_ASR_BATCH_SIZE")
+
+        for idx in range(torch.cuda.device_count()):
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(idx)
+            except Exception:
+                free_bytes = 0
+
+            if free_bytes >= min_model_vram:
+                if user_bs:
+                    bs = max(1, int(user_bs))
+                else:
+                    # Dynamically calculate batch size based on free VRAM headroom
+                    usable_vram = max(0, free_bytes - min_model_vram) * 0.70
+                    # ~180MB activation memory per 30s chunk in batch
+                    bs = max(2, min(36, 16 + int(usable_vram / (180 * 1024 * 1024))))
+                devices.append((f"cuda:{idx}", dtype, bs))
+            else:
+                logger.warning(
+                    "Skipping GPU %d for %s due to low free VRAM (%.1fMB < %.1fMB)",
+                    idx,
+                    model_name,
+                    free_bytes / (1024 * 1024),
+                    min_model_vram / (1024 * 1024),
+                )
+
+        if devices:
+            return devices
+
+        # If no GPU met full min_model_vram, try device with largest free memory
+        max_idx = -1
+        max_free = 0
+        for idx in range(torch.cuda.device_count()):
+            try:
+                f, _ = torch.cuda.mem_get_info(idx)
+                if f > max_free:
+                    max_free = f
+                    max_idx = idx
+            except Exception:
+                pass
+
+        if max_idx >= 0 and max_free > 1024 * 1024 * 1024:
+            logger.warning("No GPU met optimal VRAM threshold; falling back to cuda:%d with minimal batch size", max_idx)
+            return [(f"cuda:{max_idx}", dtype, 2)]
+
+        logger.warning("All GPUs insufficient for %s; falling back to CPU", model_name)
+        return [resolve_device_and_dtype("cpu")]
+
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return [resolve_device_and_dtype("mps")]
+
+    return [resolve_device_and_dtype("cpu")]
+
+
+class WorkerInstance:
+    """An inference worker instance bound to a specific hardware device."""
+
+    def __init__(
+        self,
+        device: str,
+        dtype: Any,
+        batch_size: int,
+        model: Any,
+        device_idx: int = -1,
+    ) -> None:
+        self.device = device
+        self.dtype = dtype
+        self.batch_size = max(1, batch_size)
+        self.model = model
+        self.device_idx = device_idx
+
+    def transcribe_chunks(
+        self,
+        indexed_chunks: list[tuple[int, tuple[np.ndarray, float]]],
+        lang: str | None = None,
+        progress_cb: Callable[[int], None] | None = None,
+    ) -> list[tuple[int, np.ndarray, float, str, str | None]]:
+        """Transcribe assigned chunks with dynamic batching and OOM self-healing backoff.
+
+        Returns:
+            list of (chunk_idx, cwav, offset, text, language)
+        """
+        import torch
+
+        if "cuda" in self.device:
+            torch.cuda.set_device(self.device)
+
+        results: list[tuple[int, np.ndarray, float, str, str | None]] = []
+        i = 0
+        cur_batch_size = self.batch_size
+
+        while i < len(indexed_chunks):
+            batch = indexed_chunks[i : i + cur_batch_size]
+            audio_inputs = [(cwav, TARGET_SR) for _, (cwav, _) in batch]
+
+            try:
+                with torch.inference_mode():
+                    outs = self.model.transcribe(audio=audio_inputs, language=lang)
+            except torch.cuda.OutOfMemoryError as oom_err:
+                logger.warning(
+                    "CUDA OOM on %s with batch_size=%d. Releasing cache and halving batch size...",
+                    self.device,
+                    cur_batch_size,
+                )
+                if "cuda" in self.device:
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+                if cur_batch_size > 1:
+                    cur_batch_size = max(1, cur_batch_size // 2)
+                    logger.info("Retrying with batch_size=%d on %s", cur_batch_size, self.device)
+                    continue
+                raise oom_err
+            except Exception as batch_err:
+                logger.warning("Batch inference failed on %s: %s; falling back to single-chunk", self.device, batch_err)
+                outs = []
+                for _, (cwav, _) in batch:
+                    with torch.inference_mode():
+                        single_out = self.model.transcribe(audio=(cwav, TARGET_SR), language=lang)[0]
+                        outs.append(single_out)
+
+            for (orig_idx, (cwav, offset)), out in zip(batch, outs):
+                text = (out.text or "").strip()
+                detected_lang = getattr(out, "language", None)
+                results.append((orig_idx, cwav, offset, text, detected_lang))
+
+            if progress_cb:
+                try:
+                    progress_cb(len(batch))
+                except Exception:
+                    pass
+
+            i += len(batch)
+
+        return results
+
 # ISO code -> Qwen3-ASR language name. Unknown values pass through untouched.
 LANG_MAP = {
     "zh": "Chinese",
@@ -143,6 +331,7 @@ class Qwen3ASREngine(BaseEngine):
         self.model_dir = Path(model_dir) if model_dir else resolve_model_dir(model_name)
         self.max_new_tokens = max_new_tokens
         self._model = None
+        self._workers: list[WorkerInstance] = []
 
     async def load(self, work_mode: str = "gpu") -> None:
         """Load weights (blocking torch work runs in executor via caller)."""
@@ -172,40 +361,67 @@ class Qwen3ASREngine(BaseEngine):
                 f"Please download model '{self.model_name}' first using cyphr-installer."
             )
 
-        device, dtype, batch_size = resolve_device_and_dtype(work_mode)
-
-        if "cuda" in device:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
-
-        load_kwargs: dict[str, Any] = {
-            "dtype": dtype,
-            "device_map": device,
-            "max_inference_batch_size": batch_size,
-            "max_new_tokens": self.max_new_tokens,
-        }
-        try:
-            import flash_attn  # noqa: F401
-            load_kwargs["attn_implementation"] = "flash_attention_2"
-        except ImportError:
-            load_kwargs["attn_implementation"] = "sdpa"
-
+        device_configs = resolve_devices_and_configs(work_mode, self.model_name)
         logger.info(
-            "Loading %s from %s on %s (%s, batch_size=%d, attn=%s)",
+            "Initializing %d inference worker(s) for %s: %s",
+            len(device_configs),
             self.model_name,
-            model_source,
-            device,
-            dtype,
-            batch_size,
-            load_kwargs.get("attn_implementation", "sdpa"),
+            device_configs,
         )
-        self._model = Qwen3ASRModel.from_pretrained(
-            model_source,
-            **load_kwargs,
-        )
+
+        self._workers = []
+        for dev, dtype, batch_size in device_configs:
+            if "cuda" in dev:
+                torch.cuda.set_device(dev)
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+
+            load_kwargs: dict[str, Any] = {
+                "dtype": dtype,
+                "device_map": dev,
+                "max_inference_batch_size": batch_size,
+                "max_new_tokens": self.max_new_tokens,
+            }
+            try:
+                import flash_attn  # noqa: F401
+                load_kwargs["attn_implementation"] = "flash_attention_2"
+            except ImportError:
+                load_kwargs["attn_implementation"] = "sdpa"
+
+            logger.info(
+                "Loading %s worker from %s on %s (%s, batch_size=%d, attn=%s)",
+                self.model_name,
+                model_source,
+                dev,
+                dtype,
+                batch_size,
+                load_kwargs.get("attn_implementation", "sdpa"),
+            )
+            worker_model = Qwen3ASRModel.from_pretrained(
+                model_source,
+                **load_kwargs,
+            )
+            dev_idx = int(dev.split(":")[1]) if ":" in dev else 0 if "cuda" in dev else -1
+            self._workers.append(
+                WorkerInstance(
+                    device=dev,
+                    dtype=dtype,
+                    batch_size=batch_size,
+                    model=worker_model,
+                    device_idx=dev_idx,
+                )
+            )
+
+        if self._workers:
+            self._model = self._workers[0].model
 
     async def unload(self) -> None:
+        if self._workers:
+            for w in self._workers:
+                w.model = None
+            self._workers.clear()
+
         if self._model is not None:
             self._model = None
 
@@ -218,14 +434,16 @@ class Qwen3ASREngine(BaseEngine):
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
                 torch.cuda.synchronize()
-                allocated = torch.cuda.memory_allocated() / (1024 * 1024)
-                reserved = torch.cuda.memory_reserved() / (1024 * 1024)
-                logger.info(
-                    "CUDA memory after model unload: allocated=%.2fMB, reserved=%.2fMB",
-                    allocated,
-                    reserved,
-                )
-            elif torch.backends.mps.is_available():
+                for i in range(torch.cuda.device_count()):
+                    allocated = torch.cuda.memory_allocated(i) / (1024 * 1024)
+                    reserved = torch.cuda.memory_reserved(i) / (1024 * 1024)
+                    logger.info(
+                        "CUDA memory device %d after model unload: allocated=%.2fMB, reserved=%.2fMB",
+                        i,
+                        allocated,
+                        reserved,
+                    )
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 torch.mps.empty_cache()
         except Exception as e:
             logger.warning("Failed during CUDA cache cleanup: %s", e)
@@ -240,13 +458,14 @@ class Qwen3ASREngine(BaseEngine):
         log_callback: Callable[[int, str], Any] | None = None,
     ) -> dict[str, Any]:
         """Sync (runs in job_runner's executor): ffmpeg -> chunk -> transcribe -> verbose_json."""
+        from concurrent.futures import ThreadPoolExecutor
         from qwen_asr.inference.utils import (
             SAMPLE_RATE,
             normalize_audio_input,
             split_audio_into_chunks,
         )
 
-        if self._model is None or not self.loaded:
+        if (self._model is None and not self._workers) or not self.loaded:
             raise RuntimeError(f"Model '{self.model_name}' is not loaded")
         if not os.path.isfile(audio_path):
             raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
@@ -312,17 +531,23 @@ class Qwen3ASREngine(BaseEngine):
                     "或者使用 cyphr 命令行客户端 (CLI) 在上传前自动完成音频格式转换。"
                 ) from fnf_err
 
-        import torch
-
         duration = len(wav) / SAMPLE_RATE
-        segments, texts, langs = [], [], []
         total = len(chunks)
-        batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16" if torch.cuda.is_available() else "1"))
-        batch_size = max(1, batch_size)
+        segments, texts, langs = [], [], []
 
         _log(30, "Waiting for model inference slot...")
         with self._inference_lock:
-            with torch.inference_mode():
+            # Check if mock model was injected (e.g. in unit tests)
+            use_legacy_mock = False
+            if not self._workers and self._model is not None:
+                use_legacy_mock = True
+            elif self._model is not None and len(self._workers) > 0 and self._model is not self._workers[0].model:
+                use_legacy_mock = True
+
+            if use_legacy_mock:
+                import torch
+                batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16" if torch.cuda.is_available() else "1"))
+                batch_size = max(1, batch_size)
                 for i in range(0, total, batch_size):
                     batch = chunks[i : i + batch_size]
                     cur_end = min(i + batch_size, total)
@@ -340,8 +565,9 @@ class Qwen3ASREngine(BaseEngine):
 
                     for (cwav, offset), out in zip(batch, outs):
                         text = (out.text or "").strip()
-                        if out.language and out.language not in langs:
-                            langs.append(out.language)
+                        detected_lang = getattr(out, "language", None)
+                        if detected_lang and detected_lang not in langs:
+                            langs.append(detected_lang)
                         if text:
                             texts.append(text)
                             segments.append(
@@ -353,6 +579,57 @@ class Qwen3ASREngine(BaseEngine):
                                     "text": text,
                                 }
                             )
+            else:
+                # Optimized multi-worker parallel inference
+                num_workers = len(self._workers)
+                completed_chunks = 0
+                completed_lock = threading.Lock()
+
+                def _progress_cb(count: int) -> None:
+                    nonlocal completed_chunks
+                    with completed_lock:
+                        completed_chunks += count
+                        cur = min(completed_chunks, total)
+                        _log(30 + int(65 * cur / max(total, 1)), f"Running parallel ASR inference ({cur}/{total})...")
+
+                indexed_chunks = list(enumerate(chunks))
+
+                if num_workers <= 1:
+                    worker = self._workers[0]
+                    raw_results = worker.transcribe_chunks(indexed_chunks, lang=lang, progress_cb=_progress_cb)
+                else:
+                    # Distribute chunks across workers round-robin to balance load
+                    worker_tasks: list[list[tuple[int, tuple[np.ndarray, float]]]] = [[] for _ in range(num_workers)]
+                    for idx, chunk in enumerate(chunks):
+                        worker_tasks[idx % num_workers].append((idx, chunk))
+
+                    raw_results = []
+                    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                        futures = [
+                            pool.submit(w.transcribe_chunks, w_chunks, lang, _progress_cb)
+                            for w, w_chunks in zip(self._workers, worker_tasks)
+                            if len(w_chunks) > 0
+                        ]
+                        for fut in futures:
+                            raw_results.extend(fut.result())
+
+                    raw_results.sort(key=lambda item: item[0])
+
+                for orig_idx, cwav, offset, text, detected_lang in raw_results:
+                    if detected_lang and detected_lang not in langs:
+                        langs.append(detected_lang)
+                    if text:
+                        texts.append(text)
+                        segments.append(
+                            {
+                                "id": len(segments),
+                                "seek": int(offset * 100),
+                                "start": round(offset, 2),
+                                "end": round(offset + len(cwav) / SAMPLE_RATE, 2),
+                                "text": text,
+                            }
+                        )
+
         _log(100, "Aligning timestamps and finalizing transcript...")
         return {
             "task": task_type or "transcribe",

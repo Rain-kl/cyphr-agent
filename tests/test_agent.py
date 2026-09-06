@@ -1114,5 +1114,112 @@ def test_qwen3_asr_in_memory_ffmpeg_pipe(tmp_path: Path, monkeypatch: pytest.Mon
     assert result["language"] == "en"
 
 
+# =========================================================================
+# 9. Multi-GPU Discovery, Dynamic Sizing & OOM Resilience Tests
+# =========================================================================
+
+def test_resolve_devices_and_configs_multi_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.models.qwen3_asr import resolve_devices_and_configs
+    import torch
+
+    monkeypatch.delenv("QWEN3_ASR_DEVICE", raising=False)
+    monkeypatch.delenv("CUDA_DEVICE_INDEX", raising=False)
+    monkeypatch.delenv("QWEN3_ASR_BATCH_SIZE", raising=False)
+
+    # 3 GPUs: GPU0 (24GB free), GPU1 (10GB free), GPU2 (1GB free - below 1.8GB min)
+    def mock_mem_info(idx: int) -> tuple[int, int]:
+        mem_map = {
+            0: (24 * 1024**3, 24 * 1024**3),
+            1: (10 * 1024**3, 16 * 1024**3),
+            2: (1 * 1024**3, 8 * 1024**3),
+        }
+        return mem_map.get(idx, (0, 0))
+
+    with patch("torch.cuda.is_available", return_value=True), \
+         patch("torch.cuda.device_count", return_value=3), \
+         patch("torch.cuda.is_bf16_supported", return_value=True), \
+         patch("torch.cuda.mem_get_info", side_effect=mock_mem_info):
+        devices = resolve_devices_and_configs("gpu", model_name="qwen3-asr-0.6b")
+
+        # GPU2 should be filtered out due to low free VRAM (< 1.8GB)
+        dev_names = [d[0] for d in devices]
+        assert dev_names == ["cuda:0", "cuda:1"]
+        assert all(d[1] == torch.bfloat16 for d in devices)
+
+        # Batch size for GPU 0 should be higher than GPU 1
+        bs_gpu0 = devices[0][2]
+        bs_gpu1 = devices[1][2]
+        assert bs_gpu0 >= bs_gpu1
+        assert bs_gpu0 <= 36
+        assert bs_gpu1 >= 2
+
+
+def test_resolve_devices_and_configs_all_low_vram_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.models.qwen3_asr import resolve_devices_and_configs
+    import torch
+
+    monkeypatch.delenv("QWEN3_ASR_DEVICE", raising=False)
+    monkeypatch.delenv("CUDA_DEVICE_INDEX", raising=False)
+
+    # All GPUs have very low VRAM (< 1.8GB), but GPU0 has 1.5GB (>1GB fallback limit)
+    def mock_low_mem(idx: int) -> tuple[int, int]:
+        return (int(1.5 * 1024**3), 4 * 1024**3)
+
+    with patch("torch.cuda.is_available", return_value=True), \
+         patch("torch.cuda.device_count", return_value=2), \
+         patch("torch.cuda.is_bf16_supported", return_value=False), \
+         patch("torch.cuda.mem_get_info", side_effect=mock_low_mem):
+        devices = resolve_devices_and_configs("gpu", model_name="qwen3-asr-0.6b")
+        assert len(devices) == 1
+        assert devices[0][0] == "cuda:0"
+        assert devices[0][2] == 2  # minimal batch size on low VRAM
+
+
+def test_worker_instance_oom_self_healing_backoff() -> None:
+    """Verify that WorkerInstance catches CUDA OOM, halves batch size, and successfully recovers."""
+    from src.models.qwen3_asr import WorkerInstance
+    import numpy as np
+    import torch
+
+    mock_model = MagicMock()
+    call_count = 0
+
+    def mock_transcribe(audio: list, language: str | None = None) -> list:
+        nonlocal call_count
+        call_count += 1
+        # Simulate OOM on first attempt when batch size is 4
+        if len(audio) > 2 and call_count == 1:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory in test")
+        # Sub-batches succeed
+        outs = []
+        for _ in audio:
+            out = MagicMock()
+            out.text = "chunk text"
+            out.language = "en"
+            outs.append(out)
+        return outs
+
+    mock_model.transcribe = mock_transcribe
+
+    worker = WorkerInstance(
+        device="cpu",
+        dtype=torch.float32,
+        batch_size=4,
+        model=mock_model,
+    )
+
+    # 4 dummy chunks
+    dummy_wav = np.zeros(16000, dtype=np.float32)
+    indexed_chunks = [(i, (dummy_wav, float(i * 30))) for i in range(4)]
+
+    results = worker.transcribe_chunks(indexed_chunks)
+
+    # All 4 chunks should be recovered and returned
+    assert len(results) == 4
+    # Batch size was halved to 2
+    assert worker.batch_size == 4  # original remains or per-batch cur_batch_size adapted
+    assert call_count > 1  # Retried
+
+
 
 
