@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
@@ -44,7 +45,7 @@ def detect_supported_modes() -> tuple[list[str], str]:
 class ModelRegistry:
     """Registry managing available ASR engine factories and loaded engine instances."""
 
-    def __init__(self, preload_default: bool = True) -> None:
+    def __init__(self, preload_default: bool = False, debug: bool | None = None) -> None:
         self._factories: dict[str, Callable[[], BaseEngine]] = {}
         self._loaded_engines: dict[str, BaseEngine] = {}
         self._load_locks: dict[str, asyncio.Lock] = {}
@@ -52,12 +53,20 @@ class ModelRegistry:
         self._inference_counts: dict[str, int] = {}
         self._drain_events: dict[str, asyncio.Event] = {}
 
+        if debug is None:
+            env_debug = os.getenv("DEBUG", os.getenv("AGENT_DEBUG", "")).lower()
+            self._debug = env_debug in ("true", "1", "yes", "on")
+        else:
+            self._debug = debug
+
         supported, default_mode = detect_supported_modes()
         self._supported_modes: list[str] = supported
         self._current_mode: str = default_mode
 
-        # Pre-register mock-whisper-base
-        self.register("mock-whisper-base", lambda: MockASREngine(model_name="mock-whisper-base"))
+        # Only register mock-whisper-base in debug mode
+        if self._debug:
+            self.register("mock-whisper-base", lambda: MockASREngine(model_name="mock-whisper-base"))
+
         # Real model: local Qwen3-ASR-0.6B package under backend/agent/models/
         self.register(MODEL_NAME_0_6B, lambda: Qwen3ASREngine(model_name=MODEL_NAME_0_6B))
         # Real model: local Qwen3-ASR-1.7B package under backend/agent/models/
@@ -66,7 +75,7 @@ class ModelRegistry:
         self.register("Qwen/Qwen3-ASR-0.6B", lambda: Qwen3ASREngine(model_name=MODEL_NAME_0_6B))
         self.register("Qwen/Qwen3-ASR-1.7B", lambda: Qwen3ASREngine(model_name=MODEL_NAME_1_7B))
 
-        if preload_default:
+        if preload_default and self._debug and "mock-whisper-base" in self._factories:
             engine = self._factories["mock-whisper-base"]()
             engine.loaded = True
             self._loaded_engines["mock-whisper-base"] = engine
@@ -111,6 +120,8 @@ class ModelRegistry:
             return engine
 
         if model_name not in self._factories:
+            if model_name == "mock-whisper-base" and not self._debug:
+                raise ValueError("Model 'mock-whisper-base' is only available in debug mode")
             raise ValueError(f"Unknown or unregistered model: {model_name}")
 
         engine = self._factories[model_name]()
@@ -220,7 +231,9 @@ class ModelRegistry:
 
     def list_downloaded_models(self) -> list[str]:
         """List names of models whose weights/config are downloaded and ready on local disk."""
-        downloaded = ["mock-whisper-base"]
+        downloaded: list[str] = []
+        if self._debug:
+            downloaded.append("mock-whisper-base")
 
         # Check Qwen models
         for name in [MODEL_NAME_0_6B, MODEL_NAME_1_7B]:

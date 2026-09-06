@@ -31,6 +31,7 @@ Configuration is loaded from `config.yaml` or overridden by environment variable
 - `HEARTBEAT_INTERVAL`: Interval in seconds between heartbeats (default: `10`)
 - `MEDIA_DIR`: Temporary media download directory (default: `/tmp/transcribe/media`)
 - `MAX_CONCURRENT_JOBS`: Maximum concurrent transcription jobs (default: `2`)
+- `DEBUG` / `AGENT_DEBUG`: Enable debug mode and mock models (default: `false`)
 
 ### Running
 

@@ -7,7 +7,7 @@ import signal
 
 from .config import load_config
 from .job_runner import JobRunner
-from .models.registry import default_registry
+from .models.registry import ModelRegistry, default_registry
 from .monitor import SystemMonitor
 from .reporter import Reporter
 from .ws_client import AgentWebSocketClient
@@ -24,12 +24,12 @@ async def main() -> None:
     )
 
     config = load_config()
-    logger.info("Loaded agent config for node '%s'", config.node_name)
+    logger.info("Loaded agent config for node '%s' (debug=%s)", config.node_name, config.debug)
     logger.info("Controller URL: %s", config.controller_url)
     logger.info("Max concurrent jobs: %d", config.max_concurrent_jobs)
 
     monitor = SystemMonitor()
-    registry = default_registry
+    registry = ModelRegistry(debug=config.debug)
     reporter = Reporter(
         base_url=config.http_base_url,
         agent_token=config.agent_token,

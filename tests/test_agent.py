@@ -31,6 +31,7 @@ def test_config_defaults() -> None:
     assert config.node_name == "agent-default"
     assert config.heartbeat_interval == 10
     assert config.max_concurrent_jobs == 2
+    assert config.debug is False
     assert config.http_base_url == "http://localhost:8080"
     assert config.ws_url == "ws://localhost:8080/api/v1/agent/ws"
 
@@ -55,7 +56,8 @@ def test_config_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         "node_name: 'yaml-node'\n"
         "heartbeat_interval: 15\n"
         "media_dir: '/tmp/yaml-media'\n"
-        "max_concurrent_jobs: 4\n",
+        "max_concurrent_jobs: 4\n"
+        "debug: false\n",
         encoding="utf-8",
     )
 
@@ -63,14 +65,16 @@ def test_config_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("AGENT_TOKEN", "env-token")
     monkeypatch.setenv("HEARTBEAT_INTERVAL", "20")
     monkeypatch.setenv("MAX_CONCURRENT_JOBS", "8")
+    monkeypatch.setenv("DEBUG", "true")
 
-    config = load_config(yaml_file)
-    assert config.controller_url == "http://env-host:7000"
-    assert config.agent_token == "env-token"
-    assert config.node_name == "yaml-node"  # from yaml since env not set
-    assert config.heartbeat_interval == 20
-    assert config.media_dir == "/tmp/yaml-media"
-    assert config.max_concurrent_jobs == 8
+    loaded = load_config(yaml_file)
+    assert loaded.controller_url == "http://env-host:7000"
+    assert loaded.agent_token == "env-token"
+    assert loaded.node_name == "yaml-node"
+    assert loaded.heartbeat_interval == 20
+    assert loaded.media_dir == "/tmp/yaml-media"
+    assert loaded.max_concurrent_jobs == 8
+    assert loaded.debug is True
 
 
 # =========================================================================
@@ -167,8 +171,34 @@ async def test_mock_asr_engine_missing_file() -> None:
 # =========================================================================
 
 @pytest.mark.asyncio
+async def test_model_registry_default_no_mock() -> None:
+    """By default, ModelRegistry must not preload any model, and mock-whisper-base is not available."""
+    registry = ModelRegistry()
+    assert registry.list_loaded_models() == []
+    assert "mock-whisper-base" not in registry.list_loaded_models()
+    assert "mock-whisper-base" not in registry.list_available_models()
+    assert "mock-whisper-base" not in registry.list_downloaded_models()
+    with pytest.raises(ValueError, match="debug mode"):
+        await registry.load_model("mock-whisper-base")
+
+
+@pytest.mark.asyncio
+async def test_model_registry_mock_in_debug_mode() -> None:
+    """When debug=True, mock-whisper-base is available but NOT preloaded by default."""
+    registry = ModelRegistry(debug=True)
+    assert registry.list_loaded_models() == []
+    assert "mock-whisper-base" in registry.list_available_models()
+    assert "mock-whisper-base" in registry.list_downloaded_models()
+
+    # It can be loaded explicitly in debug mode
+    engine = await registry.load_model("mock-whisper-base")
+    assert engine.loaded
+    assert "mock-whisper-base" in registry.list_loaded_models()
+
+
+@pytest.mark.asyncio
 async def test_model_registry_lifecycle() -> None:
-    registry = ModelRegistry(preload_default=True)
+    registry = ModelRegistry(preload_default=True, debug=True)
     assert "mock-whisper-base" in registry.list_loaded_models()
     assert "mock-whisper-base" in registry.list_available_models()
     assert "qwen3-asr-0.6b" in registry.list_available_models()
@@ -341,7 +371,7 @@ async def test_job_runner_exception_shielding_no_crash(tmp_path: Path) -> None:
     client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
     reporter = Reporter("http://test", "token", client=client)
 
-    registry = ModelRegistry(preload_default=True)
+    registry = ModelRegistry(preload_default=True, debug=True)
     runner = JobRunner(
         reporter=reporter,
         registry=registry,
@@ -579,7 +609,7 @@ async def test_job_runner_sync_engine_gil_protection(tmp_path: Path) -> None:
 async def test_ws_client_heartbeat_payload() -> None:
     config = AgentConfig(heartbeat_interval=1)
     monitor = SystemMonitor()
-    registry = ModelRegistry(preload_default=True)
+    registry = ModelRegistry(preload_default=True, debug=True)
     job_runner = MagicMock(spec=JobRunner)
     job_runner.get_running_jobs_count.return_value = 2
 
@@ -609,9 +639,37 @@ async def test_ws_client_heartbeat_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ws_client_default_heartbeat_payload_no_mock_model() -> None:
+    """Default heartbeat without debug mode must not include mock-whisper-base."""
+    config = AgentConfig(heartbeat_interval=1)
+    monitor = SystemMonitor()
+    registry = ModelRegistry()  # default: debug=False, preload_default=False
+    job_runner = MagicMock(spec=JobRunner)
+    job_runner.get_running_jobs_count.return_value = 0
+
+    client = AgentWebSocketClient(config, monitor, registry, job_runner)
+    client._running = True
+
+    mock_ws = AsyncMock()
+
+    async def stop_soon():
+        await asyncio.sleep(0.05)
+        client._running = False
+
+    asyncio.create_task(stop_soon())
+    await client._heartbeat_loop(mock_ws)
+
+    assert mock_ws.send.called
+    sent_payload = json.loads(mock_ws.send.call_args[0][0])
+    p = sent_payload["payload"]
+    assert p["loaded_models"] == []
+    assert "mock-whisper-base" not in p["downloaded_models"]
+
+
+@pytest.mark.asyncio
 async def test_registry_work_mode_and_unload_all() -> None:
     """Test setting work mode, mode validation, and unload_all_models."""
-    registry = ModelRegistry(preload_default=True)
+    registry = ModelRegistry(preload_default=True, debug=True)
     assert len(registry.list_loaded_models()) == 1
 
     # Unload all models
@@ -639,7 +697,7 @@ async def test_ws_client_work_mode_and_unload_all_handling() -> None:
     """Test WS client handling of set_work_mode and unload_all_models messages."""
     config = AgentConfig()
     monitor = SystemMonitor()
-    registry = ModelRegistry(preload_default=True)
+    registry = ModelRegistry(preload_default=True, debug=True)
     job_runner = MagicMock(spec=JobRunner)
     client = AgentWebSocketClient(config, monitor, registry, job_runner)
 

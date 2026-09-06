@@ -35,6 +35,10 @@ class AgentConfig(BaseModel):
         default=2,
         description="Maximum number of concurrently running transcription jobs",
     )
+    debug: bool = Field(
+        default=False,
+        description="Enable debug mode (allows mock models for testing)",
+    )
 
     @property
     def http_base_url(self) -> str:
@@ -109,5 +113,7 @@ def load_config(config_path: str | Path | None = None) -> AgentConfig:
             data["max_concurrent_jobs"] = int(env_max_jobs)
         except ValueError:
             pass
+    if env_debug := os.getenv("DEBUG", os.getenv("AGENT_DEBUG")):
+        data["debug"] = env_debug.lower() in ("true", "1", "yes", "on")
 
     return AgentConfig(**data)

@@ -4,3 +4,4 @@ node_name: "agent-local"
 heartbeat_interval: 5
 media_dir: "/tmp/transcribe/media"
 max_concurrent_jobs: 2
+debug: false
