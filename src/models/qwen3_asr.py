@@ -4,6 +4,7 @@
 import gc
 import logging
 import os
+import queue
 import subprocess
 import threading
 from collections.abc import Callable
@@ -145,8 +146,8 @@ def resolve_devices_and_configs(
                 else:
                     # Dynamically calculate batch size based on free VRAM headroom
                     usable_vram = max(0, free_bytes - min_model_vram) * 0.70
-                    # ~180MB activation memory per 30s chunk in batch
-                    bs = max(2, min(36, 16 + int(usable_vram / (180 * 1024 * 1024))))
+                    chunk_mem = 250 * 1024 * 1024 if "1.7b" in name_lower else 180 * 1024 * 1024
+                    bs = max(2, min(36, max(4, int(usable_vram / chunk_mem))))
                 devices.append((f"cuda:{idx}", dtype, bs))
             else:
                 logger.warning(
@@ -319,7 +320,7 @@ def resolve_model_dir(model_name: str = MODEL_NAME) -> Path:
 class Qwen3ASREngine(BaseEngine):
     """Qwen3-ASR local inference engine yielding OpenAI verbose_json."""
 
-    _inference_lock = threading.Lock()
+    supports_concurrent_inference = True
 
     def __init__(
         self,
@@ -332,6 +333,10 @@ class Qwen3ASREngine(BaseEngine):
         self.max_new_tokens = max_new_tokens
         self._model = None
         self._workers: list[WorkerInstance] = []
+        self._worker_queue: queue.Queue[WorkerInstance] = queue.Queue()
+        self._mock_lock = threading.Lock()
+        self._active_tasks: int = 0
+        self._active_tasks_lock = threading.Lock()
 
     async def load(self, work_mode: str = "gpu") -> None:
         """Load weights (blocking torch work runs in executor via caller)."""
@@ -413,6 +418,10 @@ class Qwen3ASREngine(BaseEngine):
                 )
             )
 
+        self._worker_queue = queue.Queue()
+        for w in self._workers:
+            self._worker_queue.put(w)
+
         if self._workers:
             self._model = self._workers[0].model
 
@@ -421,6 +430,12 @@ class Qwen3ASREngine(BaseEngine):
             for w in self._workers:
                 w.model = None
             self._workers.clear()
+
+        while not self._worker_queue.empty():
+            try:
+                self._worker_queue.get_nowait()
+            except queue.Empty:
+                break
 
         if self._model is not None:
             self._model = None
@@ -470,73 +485,75 @@ class Qwen3ASREngine(BaseEngine):
         if not os.path.isfile(audio_path):
             raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
 
-        lang = LANG_MAP.get(language, language) if language else None
+        with self._active_tasks_lock:
+            self._active_tasks += 1
 
-        def _log(progress: int, message: str) -> None:
-            if log_callback is None:
-                return
-            try:
-                log_callback(progress, message)
-            except Exception as e:
-                logger.warning("log_callback failed: %s", e)
-
-        _log(20, "Loading and decoding audio file...")
-        # Check if incoming audio is already a standard 16kHz mono audio (WAV or MP3) to avoid redundant conversion
-        is_standard_audio = False
         try:
-            import soundfile as sf
-            with sf.SoundFile(audio_path) as info:
-                if info.samplerate == TARGET_SR and info.channels == 1 and info.format in ("WAV", "MP3"):
-                    is_standard_audio = True
-        except Exception:
+            lang = LANG_MAP.get(language, language) if language else None
+
+            def _log(progress: int, message: str) -> None:
+                if log_callback is None:
+                    return
+                try:
+                    log_callback(progress, message)
+                except Exception as e:
+                    logger.warning("log_callback failed: %s", e)
+
+            _log(20, "Loading and decoding audio file...")
+            # Check if incoming audio is already a standard 16kHz mono audio (WAV or MP3) to avoid redundant conversion
             is_standard_audio = False
-
-        if is_standard_audio:
-            _log(30, "Direct audio feed detected (standard 16kHz mono audio), skipping ffmpeg conversion...")
-            wav = normalize_audio_input(audio_path)
-            chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
-        else:
             try:
-                r = subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-hide_banner",
-                        "-nostdin",
-                        "-loglevel",
-                        "error",
-                        "-i",
-                        audio_path,
-                        "-vn",
-                        "-ac",
-                        "1",
-                        "-ar",
-                        str(TARGET_SR),
-                        "-f",
-                        "s16le",
-                        "pipe:1",
-                    ],
-                    capture_output=True,
-                )
-                if r.returncode != 0:
-                    err_msg = r.stderr.decode("utf-8", errors="replace").strip() if r.stderr else "unknown error"
-                    raise RuntimeError(f"ffmpeg failed for {audio_path}: {err_msg}")
-                _log(30, "Preprocessing audio chunks and extracting features...")
-                pcm_data = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
-                wav = normalize_audio_input((pcm_data, TARGET_SR))
+                import soundfile as sf
+                with sf.SoundFile(audio_path) as info:
+                    if info.samplerate == TARGET_SR and info.channels == 1 and info.format in ("WAV", "MP3"):
+                        is_standard_audio = True
+            except Exception:
+                is_standard_audio = False
+
+            if is_standard_audio:
+                _log(30, "Direct audio feed detected (standard 16kHz mono audio), skipping ffmpeg conversion...")
+                wav = normalize_audio_input(audio_path)
                 chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
-            except FileNotFoundError as fnf_err:
-                raise RuntimeError(
-                    "未在当前系统中检测到 ffmpeg 可执行程序。请安装 ffmpeg 并加入系统 PATH，"
-                    "或者使用 cyphr 命令行客户端 (CLI) 在上传前自动完成音频格式转换。"
-                ) from fnf_err
+            else:
+                try:
+                    r = subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-hide_banner",
+                            "-nostdin",
+                            "-loglevel",
+                            "error",
+                            "-i",
+                            audio_path,
+                            "-vn",
+                            "-ac",
+                            "1",
+                            "-ar",
+                            str(TARGET_SR),
+                            "-f",
+                            "s16le",
+                            "pipe:1",
+                        ],
+                        capture_output=True,
+                    )
+                    if r.returncode != 0:
+                        err_msg = r.stderr.decode("utf-8", errors="replace").strip() if r.stderr else "unknown error"
+                        raise RuntimeError(f"ffmpeg failed for {audio_path}: {err_msg}")
+                    _log(30, "Preprocessing audio chunks and extracting features...")
+                    pcm_data = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+                    wav = normalize_audio_input((pcm_data, TARGET_SR))
+                    chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
+                except FileNotFoundError as fnf_err:
+                    raise RuntimeError(
+                        "未在当前系统中检测到 ffmpeg 可执行程序。请安装 ffmpeg 并加入系统 PATH，"
+                        "或者使用 cyphr 命令行客户端 (CLI) 在上传前自动完成音频格式转换。"
+                    ) from fnf_err
 
-        duration = len(wav) / SAMPLE_RATE
-        total = len(chunks)
-        segments, texts, langs = [], [], []
+            duration = len(wav) / SAMPLE_RATE
+            total = len(chunks)
+            segments, texts, langs = [], [], []
 
-        _log(30, "Waiting for model inference slot...")
-        with self._inference_lock:
             # Check if mock model was injected (e.g. in unit tests)
             use_legacy_mock = False
             if not self._workers and self._model is not None:
@@ -545,43 +562,48 @@ class Qwen3ASREngine(BaseEngine):
                 use_legacy_mock = True
 
             if use_legacy_mock:
-                import torch
-                batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16" if torch.cuda.is_available() else "1"))
-                batch_size = max(1, batch_size)
-                for i in range(0, total, batch_size):
-                    batch = chunks[i : i + batch_size]
-                    cur_end = min(i + batch_size, total)
-                    _log(30 + int(65 * cur_end / max(total, 1)), f"Running ASR batch inference ({cur_end}/{total})...")
+                _log(30, "Waiting for model inference slot...")
+                with self._mock_lock:
+                    import torch
+                    batch_size = int(os.getenv("QWEN3_ASR_BATCH_SIZE", "16" if torch.cuda.is_available() else "1"))
+                    batch_size = max(1, batch_size)
+                    for i in range(0, total, batch_size):
+                        batch = chunks[i : i + batch_size]
+                        cur_end = min(i + batch_size, total)
+                        _log(30 + int(65 * cur_end / max(total, 1)), f"Running ASR batch inference ({cur_end}/{total})...")
 
-                    audio_inputs = [(cwav, SAMPLE_RATE) for cwav, _ in batch]
-                    try:
-                        outs = self._model.transcribe(audio=audio_inputs, language=lang)
-                    except Exception as batch_err:
-                        logger.warning("Batch transcription failed, falling back to single-chunk: %s", batch_err)
-                        outs = [
-                            self._model.transcribe(audio=(cwav, SAMPLE_RATE), language=lang)[0]
-                            for cwav, _ in batch
-                        ]
+                        audio_inputs = [(cwav, SAMPLE_RATE) for cwav, _ in batch]
+                        try:
+                            outs = self._model.transcribe(audio=audio_inputs, language=lang)
+                        except Exception as batch_err:
+                            logger.warning("Batch transcription failed, falling back to single-chunk: %s", batch_err)
+                            outs = [
+                                self._model.transcribe(audio=(cwav, SAMPLE_RATE), language=lang)[0]
+                                for cwav, _ in batch
+                            ]
 
-                    for (cwav, offset), out in zip(batch, outs):
-                        text = (out.text or "").strip()
-                        detected_lang = getattr(out, "language", None)
-                        if detected_lang and detected_lang not in langs:
-                            langs.append(detected_lang)
-                        if text:
-                            texts.append(text)
-                            segments.append(
-                                {
-                                    "id": len(segments),
-                                    "seek": int(offset * 100),
-                                    "start": round(offset, 2),
-                                    "end": round(offset + len(cwav) / SAMPLE_RATE, 2),
-                                    "text": text,
-                                }
-                            )
+                        for (cwav, offset), out in zip(batch, outs):
+                            text = (out.text or "").strip()
+                            detected_lang = getattr(out, "language", None)
+                            if detected_lang and detected_lang not in langs:
+                                langs.append(detected_lang)
+                            if text:
+                                texts.append(text)
+                                segments.append(
+                                    {
+                                        "id": len(segments),
+                                        "seek": int(offset * 100),
+                                        "start": round(offset, 2),
+                                        "end": round(offset + len(cwav) / SAMPLE_RATE, 2),
+                                        "text": text,
+                                    }
+                                )
             else:
-                # Optimized multi-worker parallel inference
+                # Optimized multi-worker parallel inference with dynamic queue leasing
                 num_workers = len(self._workers)
+                if num_workers == 0:
+                    raise RuntimeError(f"No inference workers initialized for {self.model_name}")
+
                 completed_chunks = 0
                 completed_lock = threading.Lock()
 
@@ -594,22 +616,40 @@ class Qwen3ASREngine(BaseEngine):
 
                 indexed_chunks = list(enumerate(chunks))
 
-                if num_workers <= 1:
-                    worker = self._workers[0]
-                    raw_results = worker.transcribe_chunks(indexed_chunks, lang=lang, progress_cb=_progress_cb)
-                else:
-                    # Distribute chunks across workers round-robin to balance load
-                    worker_tasks: list[list[tuple[int, tuple[np.ndarray, float]]]] = [[] for _ in range(num_workers)]
-                    for idx, chunk in enumerate(chunks):
-                        worker_tasks[idx % num_workers].append((idx, chunk))
+                with self._active_tasks_lock:
+                    active = self._active_tasks
 
+                # Dynamically balance workers per task based on active concurrent tasks
+                max_job_workers = max(1, num_workers // max(1, active))
+
+                if num_workers <= 1 or max_job_workers <= 1:
+                    _log(30, "Waiting for model inference worker...")
+                    worker = self._worker_queue.get()
+                    try:
+                        raw_results = worker.transcribe_chunks(indexed_chunks, lang=lang, progress_cb=_progress_cb)
+                    finally:
+                        self._worker_queue.put(worker)
+                else:
+                    max_worker_bs = max(w.batch_size for w in self._workers)
+                    sub_batch_size = max(2, min(max_worker_bs, (total + max_job_workers - 1) // max_job_workers))
+                    sub_batches = [
+                        indexed_chunks[i : i + sub_batch_size]
+                        for i in range(0, total, sub_batch_size)
+                    ]
+
+                    def _process_sub_batch(
+                        sbatch: list[tuple[int, tuple[np.ndarray, float]]],
+                    ) -> list[tuple[int, np.ndarray, float, str, str | None]]:
+                        w = self._worker_queue.get()
+                        try:
+                            return w.transcribe_chunks(sbatch, lang=lang, progress_cb=_progress_cb)
+                        finally:
+                            self._worker_queue.put(w)
+
+                    pool_workers = min(len(sub_batches), max_job_workers)
                     raw_results = []
-                    with ThreadPoolExecutor(max_workers=num_workers) as pool:
-                        futures = [
-                            pool.submit(w.transcribe_chunks, w_chunks, lang, _progress_cb)
-                            for w, w_chunks in zip(self._workers, worker_tasks)
-                            if len(w_chunks) > 0
-                        ]
+                    with ThreadPoolExecutor(max_workers=pool_workers) as pool:
+                        futures = [pool.submit(_process_sub_batch, sb) for sb in sub_batches]
                         for fut in futures:
                             raw_results.extend(fut.result())
 
@@ -630,11 +670,14 @@ class Qwen3ASREngine(BaseEngine):
                             }
                         )
 
-        _log(100, "Aligning timestamps and finalizing transcript...")
-        return {
-            "task": task_type or "transcribe",
-            "language": langs[0] if langs else (lang or ""),
-            "duration": round(duration, 2),
-            "text": " ".join(texts),
-            "segments": segments,
-        }
+            _log(100, "Aligning timestamps and finalizing transcript...")
+            return {
+                "task": task_type or "transcribe",
+                "language": langs[0] if langs else (lang or ""),
+                "duration": round(duration, 2),
+                "text": " ".join(texts),
+                "segments": segments,
+            }
+        finally:
+            with self._active_tasks_lock:
+                self._active_tasks -= 1

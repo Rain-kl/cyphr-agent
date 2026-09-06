@@ -168,48 +168,56 @@ class JobRunner:
 
                     # 5. Perform inference with GIL protection for CPU-heavy / blocking tasks
                     loop = asyncio.get_running_loop()
-                    if self._inference_lock.locked():
-                        await self.reporter.report_logs(
-                            job_id=job_id,
-                            progress=15,
-                            logs=[{
-                                "timestamp": datetime.now(UTC).isoformat(),
-                                "level": "info",
-                                "message": "Waiting for inference engine to become available...",
-                            }],
-                        )
+                    supports_concurrent = getattr(engine, "supports_concurrent_inference", False)
 
-                    async with self._inference_lock:
+                    async def _run_inference() -> dict[str, Any]:
                         if asyncio.iscoroutinefunction(engine.transcribe):
-                            result = await engine.transcribe(
+                            return await engine.transcribe(
                                 audio_path=local_file_path,
                                 language=language,
                                 task_type=task_type,
                                 log_callback=engine_log_cb,
                             )
-                        else:
-                            pending_log_futures: list[concurrent.futures.Future[Any]] = []
+                        pending_log_futures: list[concurrent.futures.Future[Any]] = []
 
-                            def sync_log_cb(p: int, msg: str) -> None:
-                                # Fire-and-track asynchronously; do not block GPU inference worker thread
-                                fut = asyncio.run_coroutine_threadsafe(
-                                    engine_log_cb(p, msg),
-                                    loop,
-                                )
-                                pending_log_futures.append(fut)
+                        def sync_log_cb(p: int, msg: str) -> None:
+                            # Fire-and-track asynchronously; do not block GPU inference worker thread
+                            fut = asyncio.run_coroutine_threadsafe(
+                                engine_log_cb(p, msg),
+                                loop,
+                            )
+                            pending_log_futures.append(fut)
 
-                            result = await loop.run_in_executor(
-                                None,
-                                engine.transcribe,
-                                local_file_path,
-                                language,
-                                task_type,
-                                sync_log_cb,
+                        res = await loop.run_in_executor(
+                            None,
+                            engine.transcribe,
+                            local_file_path,
+                            language,
+                            task_type,
+                            sync_log_cb,
+                        )
+
+                        # Drain any in-flight log callbacks with concurrent wait (bounded to 0.5s)
+                        if pending_log_futures:
+                            concurrent.futures.wait(pending_log_futures, timeout=0.5)
+                        return res
+
+                    if supports_concurrent:
+                        result = await _run_inference()
+                    else:
+                        if self._inference_lock.locked():
+                            await self.reporter.report_logs(
+                                job_id=job_id,
+                                progress=15,
+                                logs=[{
+                                    "timestamp": datetime.now(UTC).isoformat(),
+                                    "level": "info",
+                                    "message": "Waiting for inference engine to become available...",
+                                }],
                             )
 
-                            # Drain any in-flight log callbacks with concurrent wait (bounded to 0.5s)
-                            if pending_log_futures:
-                                concurrent.futures.wait(pending_log_futures, timeout=0.5)
+                        async with self._inference_lock:
+                            result = await _run_inference()
 
                 # 6. Settle completion
                 duration = time.time() - start_time

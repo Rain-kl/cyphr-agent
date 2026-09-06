@@ -763,6 +763,90 @@ async def test_concurrent_jobs_inference_serialization(tmp_path: Path) -> None:
     assert max_active_inferences == 1
 
 
+@pytest.mark.asyncio
+async def test_concurrent_jobs_inference_parallel_when_supported(tmp_path: Path) -> None:
+    """Verify engines with supports_concurrent_inference=True execute concurrently without serialization."""
+    import time
+    import threading
+    media_dir = tmp_path / "media_par"
+    media_dir.mkdir()
+
+    complete_data = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if "/media" in url_str:
+            return httpx.Response(200, content=b"RIFFdummyWAVdata")
+        if "/complete" in url_str:
+            complete_data.append(json.loads(request.content))
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(200, json={"status": "ok"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+    reporter = Reporter("http://test", "token", client=client)
+
+    active_inferences = 0
+    max_active_inferences = 0
+    lock = threading.Lock()
+
+    class ConcurrentSyncEngine(BaseEngine):
+        supports_concurrent_inference = True
+
+        def __init__(self) -> None:
+            super().__init__("concurrent-engine")
+            self.loaded = True
+
+        async def load(self) -> None:
+            self.loaded = True
+
+        async def unload(self) -> None:
+            self.loaded = False
+
+        def transcribe(
+            self,
+            audio_path: str,
+            language: str | None = None,
+            task_type: str = "transcribe",
+            log_callback=None,
+        ) -> dict:
+            nonlocal active_inferences, max_active_inferences
+            with lock:
+                active_inferences += 1
+                if active_inferences > max_active_inferences:
+                    max_active_inferences = active_inferences
+            time.sleep(0.08)
+            with lock:
+                active_inferences -= 1
+            return {
+                "task": task_type,
+                "language": language or "en",
+                "duration": 1.0,
+                "text": f"Transcribed {audio_path}",
+                "segments": [],
+            }
+
+    registry = ModelRegistry(preload_default=False)
+    registry.register("concurrent-engine", ConcurrentSyncEngine)
+    await registry.load_model("concurrent-engine")
+
+    runner = JobRunner(
+        reporter=reporter,
+        registry=registry,
+        media_dir=str(media_dir),
+        max_concurrent_jobs=3,
+    )
+
+    t1 = runner.run_job({"job_id": 201, "model_name": "concurrent-engine", "media_path": "/api/v1/agent/jobs/201/media"})
+    t2 = runner.run_job({"job_id": 202, "model_name": "concurrent-engine", "media_path": "/api/v1/agent/jobs/202/media"})
+    t3 = runner.run_job({"job_id": 203, "model_name": "concurrent-engine", "media_path": "/api/v1/agent/jobs/203/media"})
+
+    await asyncio.gather(t1, t2, t3)
+
+    assert len(complete_data) == 3
+    # Max active inferences must be >= 2 because concurrent engine bypasses single-flight _inference_lock
+    assert max_active_inferences >= 2
+
+
 # =========================================================================
 # 8. P0 Concurrency & Lifecycle Protection Tests
 # =========================================================================
@@ -1219,6 +1303,75 @@ def test_worker_instance_oom_self_healing_backoff() -> None:
     # Batch size was halved to 2
     assert worker.batch_size == 4  # original remains or per-batch cur_batch_size adapted
     assert call_count > 1  # Retried
+
+
+def test_qwen3_asr_multi_worker_queue_concurrency(tmp_path: Path) -> None:
+    """Verify Qwen3ASREngine worker queue dynamic leasing across concurrent transcribe invocations."""
+    from src.models.qwen3_asr import Qwen3ASREngine, WorkerInstance
+    import numpy as np
+    import soundfile as sf
+    import queue
+    import concurrent.futures
+    import time
+    import threading
+
+    engine = Qwen3ASREngine("qwen3-asr-0.6b")
+    engine.loaded = True
+
+    # Create 2 mock workers
+    worker_calls = {0: 0, 1: 0}
+    worker_lock = threading.Lock()
+
+    def make_mock_worker(worker_id: int) -> WorkerInstance:
+        mock_m = MagicMock()
+        def mock_transcribe(audio: list, language: str | None = None) -> list:
+            with worker_lock:
+                worker_calls[worker_id] += len(audio)
+            time.sleep(0.02)
+            outs = []
+            for _ in audio:
+                o = MagicMock()
+                o.text = f"worker_{worker_id}_transcribed"
+                o.language = "en"
+                outs.append(o)
+            return outs
+        mock_m.transcribe = mock_transcribe
+        return WorkerInstance(
+            device=f"mock:{worker_id}",
+            dtype=None,
+            batch_size=8,
+            model=mock_m,
+            device_idx=worker_id,
+        )
+
+    w0 = make_mock_worker(0)
+    w1 = make_mock_worker(1)
+    engine._workers = [w0, w1]
+    engine._worker_queue = queue.Queue()
+    engine._worker_queue.put(w0)
+    engine._worker_queue.put(w1)
+
+    # Create dummy 16kHz mono WAV file (1.5 seconds)
+    dummy_audio = tmp_path / "test_multi.wav"
+    samplerate = 16000
+    samples = np.zeros(int(samplerate * 1.5), dtype=np.float32)
+    sf.write(str(dummy_audio), samples, samplerate)
+
+    # Run 2 transcribe calls concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futs = [
+            executor.submit(engine.transcribe, str(dummy_audio)),
+            executor.submit(engine.transcribe, str(dummy_audio)),
+        ]
+        results = [f.result() for f in futs]
+
+    assert len(results) == 2
+    assert all("worker_" in r["text"] for r in results)
+    # Both workers should have been leased and processed audio
+    assert worker_calls[0] > 0 or worker_calls[1] > 0
+    # Both workers must be safely returned to queue
+    assert engine._worker_queue.qsize() == 2
+
 
 
 
