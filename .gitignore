@@ -5,8 +5,9 @@ __pycache__/
 
 # Local configuration & downloaded models
 config.yaml
-models/
-models/*
+/models/
+/models/*
+cyphr-installer
 
 
 # C extensions

@@ -1257,118 +1257,69 @@ def test_qwen3_asr_in_memory_ffmpeg_pipe(tmp_path: Path, monkeypatch: pytest.Mon
 
 
 # =========================================================================
-# 9. Multi-GPU Discovery, Dynamic Sizing & OOM Resilience Tests
+# 9. Qwen3-ASR vLLM Engine Configuration & Inference Tests
 # =========================================================================
 
-def test_resolve_devices_and_configs_multi_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.models.qwen3_asr import resolve_devices_and_configs
-    import torch
+def test_qwen3_asr_vllm_engine_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Qwen3ASREngine default configuration and environment variable overrides."""
+    from src.models.qwen3_asr import Qwen3ASREngine
 
-    monkeypatch.delenv("QWEN3_ASR_DEVICE", raising=False)
-    monkeypatch.delenv("CUDA_DEVICE_INDEX", raising=False)
+    monkeypatch.delenv("VLLM_GPU_MEMORY_UTILIZATION", raising=False)
+    monkeypatch.delenv("VLLM_MAX_MODEL_LEN", raising=False)
     monkeypatch.delenv("QWEN3_ASR_BATCH_SIZE", raising=False)
 
-    # 3 GPUs: GPU0 (24GB free), GPU1 (10GB free), GPU2 (1GB free - below 1.8GB min)
-    def mock_mem_info(idx: int) -> tuple[int, int]:
-        mem_map = {
-            0: (24 * 1024**3, 24 * 1024**3),
-            1: (10 * 1024**3, 16 * 1024**3),
-            2: (1 * 1024**3, 8 * 1024**3),
-        }
-        return mem_map.get(idx, (0, 0))
+    engine_default = Qwen3ASREngine("qwen3-asr-0.6b")
+    assert engine_default.gpu_memory_utilization == 0.60
+    assert engine_default.max_model_len == 16384
+    assert engine_default.batch_size == 4
 
-    with patch("torch.cuda.is_available", return_value=True), \
-         patch("torch.cuda.device_count", return_value=3), \
-         patch("torch.cuda.is_bf16_supported", return_value=True), \
-         patch("torch.cuda.mem_get_info", side_effect=mock_mem_info):
-        devices = resolve_devices_and_configs("gpu", model_name="qwen3-asr-0.6b")
+    # Test environment variable overrides
+    monkeypatch.setenv("VLLM_GPU_MEMORY_UTILIZATION", "0.75")
+    monkeypatch.setenv("VLLM_MAX_MODEL_LEN", "20480")
+    monkeypatch.setenv("QWEN3_ASR_BATCH_SIZE", "6")
 
-        # GPU2 should be filtered out due to low free VRAM (< 1.8GB)
-        dev_names = [d[0] for d in devices]
-        assert dev_names == ["cuda:0", "cuda:1"]
-        assert all(d[1] == torch.bfloat16 for d in devices)
-
-        # Batch size for GPU 0 should be higher than GPU 1
-        bs_gpu0 = devices[0][2]
-        bs_gpu1 = devices[1][2]
-        assert bs_gpu0 >= bs_gpu1
-        assert bs_gpu0 <= 36
-        assert bs_gpu1 >= 2
+    engine_custom = Qwen3ASREngine("qwen3-asr-0.6b")
+    assert engine_custom.gpu_memory_utilization == 0.75
+    assert engine_custom.max_model_len == 20480
+    assert engine_custom.batch_size == 6
 
 
-def test_resolve_devices_and_configs_all_low_vram_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.models.qwen3_asr import resolve_devices_and_configs
-    import torch
+def test_qwen3_asr_vllm_load_blocking_instantiation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Verify _load_blocking calls Qwen3ASRModel.LLM with appropriate arguments."""
+    from src.models.qwen3_asr import Qwen3ASREngine
+    import json
 
-    monkeypatch.delenv("QWEN3_ASR_DEVICE", raising=False)
-    monkeypatch.delenv("CUDA_DEVICE_INDEX", raising=False)
+    model_dir = tmp_path / "mock_qwen3"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "qwen3_asr"}))
 
-    # All GPUs have very low VRAM (< 1.8GB), but GPU0 has 1.5GB (>1GB fallback limit)
-    def mock_low_mem(idx: int) -> tuple[int, int]:
-        return (int(1.5 * 1024**3), 4 * 1024**3)
+    captured_kwargs = {}
 
-    with patch("torch.cuda.is_available", return_value=True), \
-         patch("torch.cuda.device_count", return_value=2), \
-         patch("torch.cuda.is_bf16_supported", return_value=False), \
-         patch("torch.cuda.mem_get_info", side_effect=mock_low_mem):
-        devices = resolve_devices_and_configs("gpu", model_name="qwen3-asr-0.6b")
-        assert len(devices) == 1
-        assert devices[0][0] == "cuda:0"
-        assert devices[0][2] == 2  # minimal batch size on low VRAM
+    class MockLLM:
+        @classmethod
+        def LLM(cls, **kwargs):
+            nonlocal captured_kwargs
+            captured_kwargs = kwargs
+            mock_inst = MagicMock()
+            return mock_inst
 
+    monkeypatch.setattr("qwen_asr.Qwen3ASRModel", MockLLM)
 
-def test_worker_instance_oom_self_healing_backoff() -> None:
-    """Verify that WorkerInstance catches CUDA OOM, halves batch size, and successfully recovers."""
-    from src.models.qwen3_asr import WorkerInstance
-    import numpy as np
-    import torch
+    engine = Qwen3ASREngine("qwen3-asr-0.6b", model_dir=model_dir)
+    engine._load_blocking(work_mode="gpu")
 
-    mock_model = MagicMock()
-    call_count = 0
-
-    def mock_transcribe(audio: list, language: str | None = None) -> list:
-        nonlocal call_count
-        call_count += 1
-        # Simulate OOM on first attempt when batch size is 4
-        if len(audio) > 2 and call_count == 1:
-            raise torch.cuda.OutOfMemoryError("CUDA out of memory in test")
-        # Sub-batches succeed
-        outs = []
-        for _ in audio:
-            out = MagicMock()
-            out.text = "chunk text"
-            out.language = "en"
-            outs.append(out)
-        return outs
-
-    mock_model.transcribe = mock_transcribe
-
-    worker = WorkerInstance(
-        device="cpu",
-        dtype=torch.float32,
-        batch_size=4,
-        model=mock_model,
-    )
-
-    # 4 dummy chunks
-    dummy_wav = np.zeros(16000, dtype=np.float32)
-    indexed_chunks = [(i, (dummy_wav, float(i * 30))) for i in range(4)]
-
-    results = worker.transcribe_chunks(indexed_chunks)
-
-    # All 4 chunks should be recovered and returned
-    assert len(results) == 4
-    # Batch size was halved to 2
-    assert worker.batch_size == 4  # original remains or per-batch cur_batch_size adapted
-    assert call_count > 1  # Retried
+    assert captured_kwargs["model"] == str(model_dir.resolve())
+    assert captured_kwargs["gpu_memory_utilization"] == 0.60
+    assert captured_kwargs["max_model_len"] == 16384
+    assert captured_kwargs["max_inference_batch_size"] == 4
+    assert engine._model is not None
 
 
-def test_qwen3_asr_multi_worker_queue_concurrency(tmp_path: Path) -> None:
-    """Verify Qwen3ASREngine worker queue dynamic leasing across concurrent transcribe invocations."""
-    from src.models.qwen3_asr import Qwen3ASREngine, WorkerInstance
+def test_qwen3_asr_vllm_transcribe_thread_safe_lock(tmp_path: Path) -> None:
+    """Verify concurrent transcribe requests are serialized through engine lock."""
+    from src.models.qwen3_asr import Qwen3ASREngine
     import numpy as np
     import soundfile as sf
-    import queue
     import concurrent.futures
     import time
     import threading
@@ -1376,61 +1327,42 @@ def test_qwen3_asr_multi_worker_queue_concurrency(tmp_path: Path) -> None:
     engine = Qwen3ASREngine("qwen3-asr-0.6b")
     engine.loaded = True
 
-    # Create 2 mock workers
-    worker_calls = {0: 0, 1: 0}
-    worker_lock = threading.Lock()
+    concurrent_calls = 0
+    max_concurrent_observed = 0
+    lock = threading.Lock()
 
-    def make_mock_worker(worker_id: int) -> WorkerInstance:
-        mock_m = MagicMock()
-        def mock_transcribe(audio: list, language: str | None = None) -> list:
-            with worker_lock:
-                worker_calls[worker_id] += len(audio)
-            time.sleep(0.02)
-            outs = []
-            for _ in audio:
-                o = MagicMock()
-                o.text = f"worker_{worker_id}_transcribed"
-                o.language = "en"
-                outs.append(o)
-            return outs
-        mock_m.transcribe = mock_transcribe
-        return WorkerInstance(
-            device=f"mock:{worker_id}",
-            dtype=None,
-            batch_size=8,
-            model=mock_m,
-            device_idx=worker_id,
-        )
+    mock_m = MagicMock()
+    def mock_transcribe(audio: list, language: str | None = None) -> list:
+        nonlocal concurrent_calls, max_concurrent_observed
+        with lock:
+            concurrent_calls += 1
+            if concurrent_calls > max_concurrent_observed:
+                max_concurrent_observed = concurrent_calls
+        time.sleep(0.05)
+        outs = []
+        for _ in audio:
+            o = MagicMock()
+            o.text = "vllm transcribed text"
+            o.language = "zh"
+            outs.append(o)
+        with lock:
+            concurrent_calls -= 1
+        return outs
 
-    w0 = make_mock_worker(0)
-    w1 = make_mock_worker(1)
-    engine._workers = [w0, w1]
-    engine._worker_queue = queue.Queue()
-    engine._worker_queue.put(w0)
-    engine._worker_queue.put(w1)
+    mock_m.transcribe = mock_transcribe
+    engine._model = mock_m
 
-    # Create dummy 16kHz mono WAV file (1.5 seconds)
-    dummy_audio = tmp_path / "test_multi.wav"
+    dummy_audio = tmp_path / "test_vllm.wav"
     samplerate = 16000
-    samples = np.zeros(int(samplerate * 1.5), dtype=np.float32)
+    samples = np.zeros(int(samplerate * 1.0), dtype=np.float32)
     sf.write(str(dummy_audio), samples, samplerate)
 
-    # Run 2 transcribe calls concurrently
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futs = [
-            executor.submit(engine.transcribe, str(dummy_audio)),
-            executor.submit(engine.transcribe, str(dummy_audio)),
-        ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futs = [executor.submit(engine.transcribe, str(dummy_audio)) for _ in range(3)]
         results = [f.result() for f in futs]
 
-    assert len(results) == 2
-    assert all("worker_" in r["text"] for r in results)
-    # Both workers should have been leased and processed audio
-    assert worker_calls[0] > 0 or worker_calls[1] > 0
-    # Both workers must be safely returned to queue
-    assert engine._worker_queue.qsize() == 2
-
-
-
-
+    assert len(results) == 3
+    assert all("vllm transcribed text" in r["text"] for r in results)
+    # The lock must guarantee max concurrent inside transcribe loop is 1
+    assert max_concurrent_observed == 1
 
