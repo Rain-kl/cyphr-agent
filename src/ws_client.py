@@ -32,9 +32,14 @@ class AgentWebSocketClient:
         self._running = False
         self._current_ws: websockets.ClientConnection | None = None
         self._failed_jobs_cooldown: dict[int, float] = {}
+        self._pull_trigger = asyncio.Event()
         self.registry.set_auto_unload_callback(self._on_models_auto_unloaded)
         self.job_runner.on_job_rejected = self._on_job_rejected
         self.job_runner.on_job_finished = self._on_job_finished
+
+    def trigger_pull(self) -> None:
+        """Unblock the pull worker to check capacity and pull available pending jobs."""
+        self._pull_trigger.set()
 
     async def _on_models_auto_unloaded(self) -> None:
         if self._current_ws is not None:
@@ -66,10 +71,16 @@ class AgentWebSocketClient:
             except Exception as e:
                 logger.error("Failed to send reject_job for job %d: %s", job_id, e)
 
+        # Unblock pull worker when cooldown expires
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_later(60.0, self.trigger_pull)
+        except RuntimeError:
+            pass
+
     def _on_job_finished(self) -> None:
-        """Triggered when any job completes or terminates, immediately checking for more pending jobs."""
-        if self._current_ws is not None:
-            asyncio.create_task(self._check_and_pull_job(self._current_ws))
+        """Triggered when any job completes or terminates, immediately unblocking the pull worker."""
+        self.trigger_pull()
 
     async def start(self) -> None:
         """Start the WebSocket connection loop with automatic reconnect and exponential backoff."""
@@ -87,9 +98,9 @@ class AgentWebSocketClient:
                     backoff = 1.0
                     logger.info("Connected to controller WebSocket successfully")
 
-                    # Run heartbeat sender, pull loop, and incoming message consumer concurrently
+                    # Run heartbeat sender, blocking pull worker, and incoming message consumer concurrently
                     heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
-                    pull_task = asyncio.create_task(self._pull_loop(ws))
+                    pull_task = asyncio.create_task(self._pull_worker(ws))
                     try:
                         await self._message_loop(ws)
                     finally:
@@ -127,6 +138,7 @@ class AgentWebSocketClient:
     async def stop(self) -> None:
         """Signal client to stop and disconnect."""
         self._running = False
+        self._pull_trigger.set()
         if self._current_ws is not None:
             try:
                 await self._current_ws.close()
@@ -164,16 +176,31 @@ class AgentWebSocketClient:
         await ws.send(json.dumps(heartbeat_msg))
         logger.debug("Heartbeat sent: %s", payload)
 
-    async def _pull_loop(self, ws: websockets.ClientConnection) -> None:
-        """Periodically check capacity and pull available pending jobs."""
-        pull_interval = float(getattr(self.config, "pull_interval", 2.0))
+    async def _pull_worker(self, ws: websockets.ClientConnection) -> None:
+        """Blocking event-driven job pull worker.
+
+        Suspends execution with asyncio.Event.wait() when no pull is needed,
+        completely eliminating CPU spinning or polling.
+        """
+        # Initial trigger upon connection
+        self.trigger_pull()
+
         while self._running:
+            # Block until awakened by a trigger (notify_pending_jobs, job finished, cooldown expired, etc.)
+            await self._pull_trigger.wait()
+            self._pull_trigger.clear()
+
+            if not self._running:
+                break
+
             try:
                 await self._check_and_pull_job(ws)
             except Exception as exc:
-                logger.warning("Error in pull loop: %s", exc)
+                logger.warning("Error during event-driven job pull: %s", exc)
 
-            await asyncio.sleep(pull_interval)
+    async def _pull_loop(self, ws: websockets.ClientConnection) -> None:
+        """Alias for _pull_worker for backwards compatibility."""
+        await self._pull_worker(ws)
 
     async def _check_and_pull_job(self, ws: websockets.ClientConnection) -> None:
         """Proactively query controller for pending jobs when node capacity and resources allow."""
@@ -255,11 +282,11 @@ class AgentWebSocketClient:
                 logger.info("Received job %s from pull_job_result", job.get("job_id"))
                 self.job_runner.run_job(job)
                 if self.job_runner.get_running_jobs_count() < self.job_runner.max_concurrent_jobs:
-                    asyncio.create_task(self._check_and_pull_job(ws))
+                    self.trigger_pull()
 
         elif effective_action == "notify_pending_jobs":
-            logger.info("Received notify_pending_jobs from controller; triggering pull check")
-            asyncio.create_task(self._check_and_pull_job(ws))
+            logger.info("Received notify_pending_jobs from controller; unblocking pull worker")
+            self.trigger_pull()
 
         elif effective_action == "load_model":
             model_name = payload.get("model_name", "")

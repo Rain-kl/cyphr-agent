@@ -2188,3 +2188,59 @@ async def test_failed_jobs_cooldown_and_exclusion() -> None:
     await client._check_and_pull_job(mock_ws)
     sent_pull2 = json.loads(mock_ws.send.call_args[0][0])
     assert 12345 not in sent_pull2["payload"]["exclude_job_ids"]
+
+
+@pytest.mark.asyncio
+async def test_pull_worker_blocking_no_cpu_spinning() -> None:
+    """Verify pull worker operates in blocking event-driven mode instead of spinning/polling."""
+    mock_config = AgentConfig()
+    mock_monitor = MagicMock()
+    mock_registry = MagicMock()
+    mock_job_runner = MagicMock()
+
+    mock_ws = AsyncMock()
+    client = AgentWebSocketClient(
+        config=mock_config,
+        monitor=mock_monitor,
+        registry=mock_registry,
+        job_runner=mock_job_runner,
+    )
+    client._running = True
+    client._current_ws = mock_ws
+    mock_job_runner.get_running_jobs_count.return_value = 0
+    mock_job_runner.max_concurrent_jobs = 2
+    mock_registry.check_resources_available.return_value = True
+    mock_registry.list_available_models.return_value = ["qwen3-asr-0.6b"]
+
+    # Start the blocking worker
+    worker_task = asyncio.create_task(client._pull_worker(mock_ws))
+
+    # Give it a moment to run initial pull
+    await asyncio.sleep(0.02)
+    assert mock_ws.send.call_count == 1
+    mock_ws.send.reset_mock()
+
+    # Worker must now be BLOCKED in await self._pull_trigger.wait()
+    # It must NOT spin or poll in the background
+    await asyncio.sleep(0.1)
+    assert mock_ws.send.call_count == 0, "Pull worker must not spin or poll while waiting"
+
+    # Event 1: Server sends notify_pending_jobs
+    client.trigger_pull()
+    await asyncio.sleep(0.02)
+    assert mock_ws.send.call_count == 1, "Pull worker must unblock when triggered"
+    mock_ws.send.reset_mock()
+
+    # Again, worker must be blocked
+    await asyncio.sleep(0.05)
+    assert mock_ws.send.call_count == 0
+
+    # Event 2: Job finishes -> triggers pull
+    client._on_job_finished()
+    await asyncio.sleep(0.02)
+    assert mock_ws.send.call_count == 1, "Pull worker must unblock when job finishes"
+
+    # Stop client and verify clean exit without hanging
+    await client.stop()
+    await asyncio.wait_for(worker_task, timeout=1.0)
+    assert worker_task.done()
