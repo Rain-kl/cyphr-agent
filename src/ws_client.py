@@ -33,6 +33,7 @@ class AgentWebSocketClient:
         self._current_ws: websockets.ClientConnection | None = None
         self._failed_jobs_cooldown: dict[int, float] = {}
         self._pull_trigger = asyncio.Event()
+        self._chat_tasks: dict[str, asyncio.Task[None]] = {}
         self.registry.set_auto_unload_callback(self._on_models_auto_unloaded)
         self.job_runner.on_job_rejected = self._on_job_rejected
         self.job_runner.on_job_finished = self._on_job_finished
@@ -139,6 +140,9 @@ class AgentWebSocketClient:
         """Signal client to stop and disconnect."""
         self._running = False
         self._pull_trigger.set()
+        for task in list(self._chat_tasks.values()):
+            task.cancel()
+        self._chat_tasks.clear()
         if self._current_ws is not None:
             try:
                 await self._current_ws.close()
@@ -288,6 +292,25 @@ class AgentWebSocketClient:
             logger.info("Received notify_pending_jobs from controller; unblocking pull worker")
             self.trigger_pull()
 
+        elif effective_action == "chat_completion":
+            request_id = data.get("request_id") or payload.get("request_id") or ""
+            if request_id:
+                logger.info("Starting real-time streaming chat completion %s", request_id)
+                task = asyncio.create_task(self._handle_chat_completion(ws, request_id, payload))
+                self._chat_tasks[request_id] = task
+                task.add_done_callback(lambda _: self._chat_tasks.pop(request_id, None))
+
+        elif effective_action == "chat_abort":
+            request_id = data.get("request_id") or payload.get("request_id") or ""
+            if request_id:
+                logger.info("Aborting chat completion %s", request_id)
+                if task := self._chat_tasks.get(request_id):
+                    task.cancel()
+                model_name = payload.get("model", "tencent/Hy-MT2-1.8B")
+                engine = self.registry.get_engine(model_name)
+                if engine and hasattr(engine, "abort"):
+                    asyncio.create_task(engine.abort(request_id))
+
         elif effective_action == "load_model":
             model_name = payload.get("model_name", "")
             if model_name:
@@ -361,3 +384,62 @@ class AgentWebSocketClient:
             },
         }
         await ws.send(json.dumps(msg))
+
+    async def _handle_chat_completion(
+        self,
+        ws: websockets.ClientConnection,
+        request_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Stream real-time chat completion tokens back through WebSocket tunnel."""
+        model_name = payload.get("model", "tencent/Hy-MT2-1.8B")
+        prompt = payload.get("prompt", "")
+        messages = payload.get("messages")
+        target_lang = payload.get("target_lang", "zh")
+        source_lang = payload.get("source_lang")
+        temperature = float(payload.get("temperature", 0.7))
+        max_tokens = int(payload.get("max_tokens", 2048))
+
+        try:
+            async with self.registry.acquire_engine(model_name) as engine:
+                if not hasattr(engine, "generate_stream"):
+                    raise RuntimeError(
+                        f"Engine '{model_name}' does not support streaming generation"
+                    )
+
+                async for delta, finish_reason in engine.generate_stream(
+                    request_id=request_id,
+                    prompt=prompt,
+                    target_lang=target_lang,
+                    source_lang=source_lang,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    messages=messages,
+                ):
+                    chunk_msg = {
+                        "type": "chat_chunk",
+                        "request_id": request_id,
+                        "payload": {
+                            "delta": delta,
+                            "finish_reason": finish_reason,
+                        },
+                    }
+                    await ws.send(json.dumps(chunk_msg))
+
+        except asyncio.CancelledError:
+            logger.info("Chat completion %s cancelled", request_id)
+        except Exception as exc:
+            logger.exception("Error during chat completion %s: %s", request_id, exc)
+            try:
+                err_msg = {
+                    "type": "chat_chunk",
+                    "request_id": request_id,
+                    "payload": {
+                        "delta": "",
+                        "finish_reason": "error",
+                        "error": str(exc),
+                    },
+                }
+                await ws.send(json.dumps(err_msg))
+            except Exception:
+                pass

@@ -11,6 +11,13 @@ from typing import Any
 from ..core.engine import BaseModelEngine
 from ..resources.hardware import detect_supported_modes, resolve_devices
 from .base import BaseEngine
+from .hy_mt2 import (
+    ALIAS_HY_MT2_CAMEL,
+    ALIAS_HY_MT2_SHORT,
+    MODEL_NAME_HY_MT2,
+    HyMT2Engine,
+    resolve_model_dir as resolve_hy_mt2_dir,
+)
 from .mock_asr import MockASREngine
 from .qwen3_asr import (
     MODEL_NAME_0_6B,
@@ -58,6 +65,11 @@ class ModelRegistry:
         # Hugging Face aliases for seamless interoperability
         self.register("Qwen/Qwen3-ASR-0.6B", lambda: Qwen3ASREngine(model_name=MODEL_NAME_0_6B))
         self.register("Qwen/Qwen3-ASR-1.7B", lambda: Qwen3ASREngine(model_name=MODEL_NAME_1_7B))
+
+        # Real model: Tencent Hy-MT2-1.8B multilingual translation model
+        self.register(MODEL_NAME_HY_MT2, lambda: HyMT2Engine(model_name=MODEL_NAME_HY_MT2))
+        self.register(ALIAS_HY_MT2_SHORT, lambda: HyMT2Engine(model_name=MODEL_NAME_HY_MT2))
+        self.register(ALIAS_HY_MT2_CAMEL, lambda: HyMT2Engine(model_name=MODEL_NAME_HY_MT2))
 
         if preload_default and self._debug and "mock-whisper-base" in self._factories:
             engine = self._factories["mock-whisper-base"]()
@@ -324,6 +336,20 @@ class ModelRegistry:
                             downloaded.append("Qwen/Qwen3-ASR-0.6B")
                         elif name == MODEL_NAME_1_7B:
                             downloaded.append("Qwen/Qwen3-ASR-1.7B")
+
+        # Check Hy-MT2 models
+        hy_mt2_dir = resolve_hy_mt2_dir()
+        if hy_mt2_dir.is_dir():
+            if hy_mt2_dir.joinpath("config.json").is_file():
+                has_weights = any(
+                    p.suffix in {".safetensors", ".bin", ".pt"}
+                    for p in hy_mt2_dir.iterdir()
+                    if p.is_file()
+                )
+                if has_weights:
+                    downloaded.extend([MODEL_NAME_HY_MT2, ALIAS_HY_MT2_SHORT, ALIAS_HY_MT2_CAMEL])
+        elif self._debug or os.getenv("HY_MT2_MOCK", "").lower() in ("1", "true", "yes"):
+            downloaded.extend([MODEL_NAME_HY_MT2, ALIAS_HY_MT2_SHORT, ALIAS_HY_MT2_CAMEL])
 
         return downloaded
 
