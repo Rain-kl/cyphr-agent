@@ -13,6 +13,7 @@ dependencies = [
     "qwen-asr",
     "torch",
     "huggingface-hub",
+    "vllm>=0.14.0",
 ]
 
 [dependency-groups]
