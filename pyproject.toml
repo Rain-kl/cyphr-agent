@@ -17,6 +17,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pylint>=4.0.8",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.16.6",
@@ -51,6 +52,7 @@ select = [
     "RET",    # flake8-return (return statement consistency)
     "RUF",    # Ruff-specific rules
     "S",      # flake8-bandit (security checks)
+    "PLR2004", # magic-value-comparison (魔法值检测)
 ]
 ignore = [
     "E501",   # line-too-long (handled by ruff format)
@@ -73,10 +75,21 @@ ignore = [
 combine-as-imports = true
 known-first-party = ["src"]
 
+[tool.ruff.lint.pylint]
+allow-magic-value-types = ["str", "bytes"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
 docstring-code-format = true
 
+[tool.pylint.main]
+ignore = [".git", ".venv", "models", "tests"]
 
+[tool.pylint.similarities]
+min-similarity-lines = 6
+ignore-comments = true
+ignore-docstrings = true
+ignore-imports = true
+ignore-signatures = true

@@ -71,9 +71,10 @@ uv run pytest
 ### Code Linting & Formatting
 
 ```bash
-uv run ruff check .          # Static analysis and linting
+uv run ruff check .          # Static analysis and linting (includes PLR2004 magic value check)
 uv run ruff check --fix .    # Auto-fix lint violations
 uv run ruff format .         # Code formatting
 uv run ruff format --check . # Verify formatting in CI
+uv run pylint --disable=all --enable=duplicate-code src/ # Duplicate code detection (dupl)
 ```
 
