@@ -110,6 +110,40 @@ def _process_audio_chunks(audio_path: str) -> tuple[np.ndarray, list[tuple[np.nd
     return wav, chunks
 
 
+def calculate_dynamic_gpu_utilization(
+    device_id: int | str,
+    gpu_memory_utilization: float,
+    free_ratio: float = 0.70,
+    mock_free_bytes: int | None = None,
+    mock_total_bytes: int | None = None,
+) -> float:
+    """Calculate effective vLLM gpu_memory_utilization based on remaining free VRAM.
+
+    Prevents OOM when other processes (e.g. training jobs) occupy parts of the GPU memory.
+    """
+    if str(device_id).lower() == "cpu":
+        return gpu_memory_utilization
+
+    try:
+        if mock_free_bytes is not None and mock_total_bytes is not None:
+            free_bytes, total_bytes = mock_free_bytes, mock_total_bytes
+        else:
+            import torch
+
+            if not torch.cuda.is_available():
+                return gpu_memory_utilization
+            dev_idx = int(device_id) if isinstance(device_id, int) or str(device_id).isdigit() else 0
+            free_bytes, total_bytes = torch.cuda.mem_get_info(dev_idx)
+
+        if total_bytes > 0:
+            target_util = (free_bytes * free_ratio) / total_bytes
+            return min(gpu_memory_utilization, max(0.15, target_util))
+    except Exception as e:
+        logger.warning("Failed to compute dynamic GPU memory utilization for device %s: %s", device_id, e)
+
+    return gpu_memory_utilization
+
+
 def asr_worker_process_main(
     device_id: int | str,
     model_source: str,
@@ -134,11 +168,21 @@ def asr_worker_process_main(
         resp_queue.put(("error", device_id, f"Failed to import qwen_asr: {e}"))
         return
 
+    # Calculate dynamic VRAM utilization based on remaining free memory
+    free_ratio = float(os.getenv("VLLM_FREE_MEMORY_RATIO", "0.70"))
+    effective_gpu_util = calculate_dynamic_gpu_utilization(
+        device_id=device_id,
+        gpu_memory_utilization=gpu_memory_utilization,
+        free_ratio=free_ratio,
+    )
+
     logger.info(
-        "[Worker Device %s] Initializing vLLM engine for %s (gpu_util=%.2f, max_model_len=%d, batch_size=%d)...",
+        "[Worker Device %s] Initializing vLLM engine for %s (gpu_util=%.2f [effective=%.2f, ratio=%.2f], max_model_len=%d, batch_size=%d)...",
         device_id,
         model_name,
         gpu_memory_utilization,
+        effective_gpu_util,
+        free_ratio,
         max_model_len,
         batch_size,
     )
@@ -146,7 +190,7 @@ def asr_worker_process_main(
     try:
         model = Qwen3ASRModel.LLM(
             model=model_source,
-            gpu_memory_utilization=gpu_memory_utilization,
+            gpu_memory_utilization=effective_gpu_util,
             max_model_len=max_model_len,
             max_inference_batch_size=batch_size,
             enable_sleep_mode=True,
@@ -327,6 +371,7 @@ class WorkerProxy:
         sleep_idle_seconds: float,
     ) -> None:
         self.device_id = device_id
+        self.is_sleeping = False
         ctx = mp.get_context("spawn")
         self.cmd_queue = ctx.Queue()
         self.resp_queue = ctx.Queue()
@@ -373,6 +418,7 @@ class WorkerProxy:
         timeout: float = 600.0,
     ) -> dict[str, Any]:
         """Send transcription task to worker and stream progress callbacks."""
+        self.is_sleeping = False
         task_id = uuid.uuid4().hex[:8]
         self.cmd_queue.put(("transcribe", task_id, audio_path, language, task_type))
 
@@ -400,6 +446,7 @@ class WorkerProxy:
         raise TimeoutError(f"Transcription on device {self.device_id} timed out after {timeout}s")
 
     def enter_sleep(self) -> None:
+        self.is_sleeping = True
         if self.process.is_alive():
             try:
                 self.cmd_queue.put(("sleep",))
@@ -407,6 +454,7 @@ class WorkerProxy:
                 pass
 
     def stop(self, timeout: float = 3.0) -> None:
+        self.is_sleeping = True
         if self.process.is_alive():
             try:
                 self.cmd_queue.put(("stop",))

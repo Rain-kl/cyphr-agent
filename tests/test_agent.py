@@ -4,6 +4,8 @@
 import asyncio
 import json
 import os
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1819,3 +1821,370 @@ def test_system_monitor_multi_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
     assert util == 80.0
     assert used_mb == 6000
     assert total_mb == 48000
+
+
+# =========================================================================
+# 12. Dynamic VRAM Probe, Multi-GPU & Pull Mechanism Tests
+# =========================================================================
+
+
+def test_dynamic_vram_ratio_calculation() -> None:
+    """Verify dynamic VRAM ratio calculates utilization based on remaining free memory."""
+    from src.models.worker import calculate_dynamic_gpu_utilization
+
+    # Scenario: Total 16GB, Free 16GB, free_ratio=0.70, max_util=0.60
+    # Expected: (16 * 0.70) / 16 = 0.70, clamped to max_util 0.60
+    util = calculate_dynamic_gpu_utilization(
+        device_id=0,
+        gpu_memory_utilization=0.60,
+        free_ratio=0.70,
+        mock_free_bytes=16 * 1024**3,
+        mock_total_bytes=16 * 1024**3,
+    )
+    assert util == 0.60
+
+    # Scenario: Total 16GB, Free 6GB (due to other processes), free_ratio=0.70, max_util=0.60
+    # Expected: (6 * 0.70) / 16 = 0.2625
+    util2 = calculate_dynamic_gpu_utilization(
+        device_id=0,
+        gpu_memory_utilization=0.60,
+        free_ratio=0.70,
+        mock_free_bytes=6 * 1024**3,
+        mock_total_bytes=16 * 1024**3,
+    )
+    assert round(util2, 4) == 0.2625
+
+
+@pytest.mark.asyncio
+async def test_scenario_1_initial_load_card1_full_card2_idle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Scenario 1:
+    (a) Before load, Card 1 VRAM is 90% occupied (< 2048 MB free), Card 2 is 0% occupied.
+    (b) Expected: Card 1 skips loading, Card 2 loads model and executes inference.
+    """
+    import torch
+
+    from src.models.qwen3_asr import Qwen3ASREngine, resolve_devices
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    def mock_mem_get_info(dev=0):
+        dev_idx = int(dev) if isinstance(dev, (int, str)) and str(dev).isdigit() else 0
+        if dev_idx == 0:
+            return (1600 * 1024 * 1024, 16000 * 1024 * 1024)
+        return (16000 * 1024 * 1024, 16000 * 1024 * 1024)
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", mock_mem_get_info)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("CUDA_DEVICE_INDEX", raising=False)
+    monkeypatch.delenv("QWEN3_ASR_DEVICE", raising=False)
+
+    # 1. resolve_devices should filter out dev 0 and return only [1]
+    devices = resolve_devices("gpu")
+    assert devices == [1]
+
+    # 2. Engine load should only initialize worker on dev 1
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"model_type": "qwen3_asr"}')
+
+    created_proxies = []
+
+    class MockProxy:
+        def __init__(self, device_id, **kwargs):
+            self.device_id = device_id
+            self.is_sleeping = False
+            created_proxies.append(self)
+
+        def wait_ready(self, timeout=60.0):
+            pass
+
+        def execute_transcribe(self, audio_path, language, task_type, log_callback=None):
+            return {"task": "transcribe", "text": f"Transcribed on card {self.device_id}"}
+
+        def enter_sleep(self):
+            self.is_sleeping = True
+
+        def stop(self, timeout=3.0):
+            pass
+
+    monkeypatch.setattr("src.models.worker.WorkerProxy", MockProxy)
+
+    engine = Qwen3ASREngine(model_name="qwen3-asr-0.6b", model_dir=tmp_path)
+    await engine.load("gpu")
+
+    # Verify only 1 worker was created and it is on device 1 (Card 2)
+    assert len(created_proxies) == 1
+    assert created_proxies[0].device_id == 1
+    assert len(engine._workers) == 1
+    assert engine._workers[0].device_id == 1
+
+    # Verify inference executes on Card 2
+    dummy_audio = tmp_path / "audio.wav"
+    dummy_audio.write_bytes(b"dummy audio")
+    result = engine.transcribe(str(dummy_audio))
+    assert result["text"] == "Transcribed on card 1"
+
+
+def test_scenario_2_dynamic_scheduling_card1_external_task_card2_executes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Scenario 2:
+    (a) Both cards loaded and sleeping. External training occupies Card 1 up to 90% (< 1536 MB free).
+    (b) Expected: Card 1 cannot restore KV cache and is skipped; Card 2 wakes up and executes inference.
+    """
+    import sys
+
+    from src.models.qwen3_asr import Qwen3ASREngine
+
+    mock_torch = MagicMock()
+    mock_torch.cuda.is_available.return_value = True
+
+    # Card 1 has 500 MB (< 1536 MB), Card 2 has 14000 MB (>= 1536 MB)
+    def mock_mem_get_info(dev=0):
+        dev_idx = int(dev) if isinstance(dev, (int, str)) and str(dev).isdigit() else 0
+        if dev_idx == 0:
+            return (500 * 1024 * 1024, 16000 * 1024 * 1024)
+        return (14000 * 1024 * 1024, 16000 * 1024 * 1024)
+
+    mock_torch.cuda.mem_get_info.side_effect = mock_mem_get_info
+    monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    class MockProxy:
+        def __init__(self, device_id):
+            self.device_id = device_id
+            self.is_sleeping = True  # Both sleeping initially
+            self.executed = False
+
+        def execute_transcribe(self, audio_path, language, task_type, log_callback=None):
+            self.executed = True
+            self.is_sleeping = False
+            return {"task": "transcribe", "text": f"Transcribed by card {self.device_id}"}
+
+    worker_card1 = MockProxy(device_id=0)
+    worker_card2 = MockProxy(device_id=1)
+
+    engine = Qwen3ASREngine(model_name="qwen3-asr-0.6b", model_dir=tmp_path)
+    engine.loaded = True
+    engine._workers = [worker_card1, worker_card2]
+    engine._worker_queue.put(worker_card1)
+    engine._worker_queue.put(worker_card2)
+
+    dummy_audio = tmp_path / "audio.wav"
+    dummy_audio.write_bytes(b"dummy audio")
+
+    # Transcribe task arrives
+    result = engine.transcribe(str(dummy_audio))
+
+    # Expect: Card 1 was skipped (did not execute), Card 2 executed
+    assert worker_card1.executed is False
+    assert worker_card2.executed is True
+    assert result["text"] == "Transcribed by card 1"
+
+
+def test_scenario_3_both_cards_exceeded_reject_job_and_cooldown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Scenario 3:
+    (a) Both cards loaded and sleeping. External training occupies BOTH cards up to 90% (< 1536 MB free).
+    (b) Expected: Neither can wake up -> InsufficientVRAMError raised.
+    """
+    import sys
+
+    from src.models.qwen3_asr import InsufficientVRAMError, Qwen3ASREngine
+
+    mock_torch = MagicMock()
+    mock_torch.cuda.is_available.return_value = True
+
+    # Both cards have 500 MB (< 1536 MB)
+    mock_torch.cuda.mem_get_info.return_value = (500 * 1024 * 1024, 16000 * 1024 * 1024)
+    monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    class MockProxy:
+        def __init__(self, device_id):
+            self.device_id = device_id
+            self.is_sleeping = True
+
+        def execute_transcribe(self, audio_path, language, task_type, log_callback=None):
+            return {"task": "transcribe", "text": "ok"}
+
+    worker_card1 = MockProxy(device_id=0)
+    worker_card2 = MockProxy(device_id=1)
+
+    engine = Qwen3ASREngine(model_name="qwen3-asr-0.6b", model_dir=tmp_path)
+    engine.loaded = True
+    engine._workers = [worker_card1, worker_card2]
+    engine._worker_queue.put(worker_card1)
+    engine._worker_queue.put(worker_card2)
+
+    dummy_audio = tmp_path / "audio.wav"
+    dummy_audio.write_bytes(b"dummy audio")
+
+    with pytest.raises(InsufficientVRAMError) as exc_info:
+        engine.transcribe(str(dummy_audio))
+
+    assert "insufficient free vram" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_job_runner_reject_on_insufficient_vram(tmp_path: Path) -> None:
+    """Verify JobRunner catches InsufficientVRAMError and invokes on_job_rejected instead of marking failed."""
+    from src.models.qwen3_asr import InsufficientVRAMError
+
+    mock_reporter = AsyncMock()
+    mock_registry = MagicMock()
+
+    class FaultyEngine(BaseEngine):
+        supports_concurrent_inference = True
+
+        async def load(self, work_mode: str = "gpu") -> None:
+            self.loaded = True
+
+        async def unload(self) -> None:
+            self.loaded = False
+
+        def transcribe(self, audio_path, language=None, task_type="transcribe", log_callback=None):
+            raise InsufficientVRAMError("All GPU workers have insufficient free VRAM")
+
+    faulty_engine = FaultyEngine("qwen3-asr-0.6b")
+    faulty_engine.loaded = True
+
+    @asynccontextmanager
+    async def mock_acquire(model_name):
+        yield faulty_engine
+
+    mock_registry.acquire_engine = mock_acquire
+
+    rejected_calls = []
+
+    async def mock_on_rejected(job_id: int, reason: str) -> None:
+        rejected_calls.append((job_id, reason))
+
+    runner = JobRunner(
+        reporter=mock_reporter,
+        registry=mock_registry,
+        media_dir=str(tmp_path),
+        on_job_rejected=mock_on_rejected,
+    )
+
+    dummy_payload = {
+        "job_id": 999999,
+        "model_name": "qwen3-asr-0.6b",
+        "media_path": "/api/v1/agent/jobs/999999/media",
+    }
+
+    # Run job
+    task = runner.run_job(dummy_payload)
+    await task
+
+    # Verify on_job_rejected called
+    assert len(rejected_calls) == 1
+    assert rejected_calls[0][0] == 999999
+    assert "insufficient free vram" in rejected_calls[0][1].lower()
+
+    # Verify reporter.report_completion was NOT called with status="failed"
+    assert mock_reporter.report_completion.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pull_job_resource_check_optimization() -> None:
+    """Verify resource check optimization:
+    1. When running_jobs == 0: probes VRAM before pull.
+    2. When running_jobs > 0 and model is active: skips VRAM probe.
+    """
+    mock_config = AgentConfig()
+    mock_monitor = MagicMock()
+    mock_registry = MagicMock()
+    mock_job_runner = MagicMock()
+
+    mock_ws = AsyncMock()
+    client = AgentWebSocketClient(
+        config=mock_config,
+        monitor=mock_monitor,
+        registry=mock_registry,
+        job_runner=mock_job_runner,
+    )
+    client._running = True
+
+    # Case 1: running_jobs == 0, resource check returns False -> NO pull_job sent
+    mock_job_runner.get_running_jobs_count.return_value = 0
+    mock_job_runner.max_concurrent_jobs = 2
+    mock_registry.check_resources_available.return_value = False
+
+    await client._check_and_pull_job(mock_ws)
+    assert mock_ws.send.call_count == 0
+    mock_registry.check_resources_available.assert_called_once()
+
+    # Case 2: running_jobs == 0, resource check returns True -> pull_job sent
+    mock_registry.check_resources_available.reset_mock()
+    mock_registry.check_resources_available.return_value = True
+    mock_registry.list_available_models.return_value = ["qwen3-asr-0.6b"]
+
+    await client._check_and_pull_job(mock_ws)
+    assert mock_ws.send.call_count == 1
+    sent_data = json.loads(mock_ws.send.call_args[0][0])
+    assert sent_data["type"] == "pull_job"
+    assert sent_data["payload"]["supported_models"] == ["qwen3-asr-0.6b"]
+
+    # Case 3: running_jobs == 1 (second job), model is active -> skips check_resources_available!
+    mock_ws.send.reset_mock()
+    mock_registry.check_resources_available.reset_mock()
+    mock_job_runner.get_running_jobs_count.return_value = 1
+    mock_registry.is_model_active.return_value = True
+
+    await client._check_and_pull_job(mock_ws)
+    assert mock_ws.send.call_count == 1
+    # Crucial assertion: check_resources_available was NOT called!
+    assert mock_registry.check_resources_available.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_jobs_cooldown_and_exclusion() -> None:
+    """Verify rejected job is placed on 1-minute cooldown and excluded in pull_job."""
+    mock_config = AgentConfig()
+    mock_monitor = MagicMock()
+    mock_registry = MagicMock()
+    mock_job_runner = MagicMock()
+
+    mock_ws = AsyncMock()
+    client = AgentWebSocketClient(
+        config=mock_config,
+        monitor=mock_monitor,
+        registry=mock_registry,
+        job_runner=mock_job_runner,
+    )
+    client._running = True
+    client._current_ws = mock_ws
+    mock_job_runner.get_running_jobs_count.return_value = 0
+    mock_job_runner.max_concurrent_jobs = 2
+    mock_registry.check_resources_available.return_value = True
+    mock_registry.list_available_models.return_value = ["qwen3-asr-0.6b"]
+
+    # Reject job 12345
+    await client._on_job_rejected(12345, "insufficient_vram")
+
+    # Verify reject_job sent over WS
+    assert mock_ws.send.call_count == 1
+    sent_reject = json.loads(mock_ws.send.call_args[0][0])
+    assert sent_reject["type"] == "reject_job"
+    assert sent_reject["payload"]["job_id"] == 12345
+
+    # Verify cooldown exists
+    assert 12345 in client._failed_jobs_cooldown
+    assert client._failed_jobs_cooldown[12345] > time.time() + 50.0
+
+    # Now pull job -> exclude_job_ids must contain 12345
+    mock_ws.send.reset_mock()
+    await client._check_and_pull_job(mock_ws)
+    assert mock_ws.send.call_count == 1
+    sent_pull = json.loads(mock_ws.send.call_args[0][0])
+    assert sent_pull["type"] == "pull_job"
+    assert 12345 in sent_pull["payload"]["exclude_job_ids"]
+
+    # If cooldown expires (simulate past time)
+    client._failed_jobs_cooldown[12345] = time.time() - 1.0
+    mock_ws.send.reset_mock()
+    await client._check_and_pull_job(mock_ws)
+    sent_pull2 = json.loads(mock_ws.send.call_args[0][0])
+    assert 12345 not in sent_pull2["payload"]["exclude_job_ids"]

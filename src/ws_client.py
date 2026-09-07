@@ -1,9 +1,7 @@
-# Copyright 2026 Arctel.net
-# SPDX-License-Identifier: Apache-2.0
-
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 import websockets
@@ -33,7 +31,10 @@ class AgentWebSocketClient:
         self.job_runner = job_runner
         self._running = False
         self._current_ws: websockets.ClientConnection | None = None
+        self._failed_jobs_cooldown: dict[int, float] = {}
         self.registry.set_auto_unload_callback(self._on_models_auto_unloaded)
+        self.job_runner.on_job_rejected = self._on_job_rejected
+        self.job_runner.on_job_finished = self._on_job_finished
 
     async def _on_models_auto_unloaded(self) -> None:
         if self._current_ws is not None:
@@ -42,6 +43,33 @@ class AgentWebSocketClient:
                 await self._send_heartbeat(self._current_ws)
             except Exception as e:
                 logger.warning("Failed to report auto-unload status: %s", e)
+
+    async def _on_job_rejected(self, job_id: int, reason: str) -> None:
+        self._failed_jobs_cooldown[job_id] = time.time() + 60.0
+        logger.warning(
+            "Job %d placed on 1-minute local cooldown due to rejection (reason: %s)",
+            job_id,
+            reason,
+        )
+        if self._current_ws is not None:
+            try:
+                reject_msg = {
+                    "type": "reject_job",
+                    "action": "reject_job",
+                    "payload": {
+                        "job_id": job_id,
+                        "reason": reason,
+                    },
+                }
+                await self._current_ws.send(json.dumps(reject_msg))
+                logger.info("Sent reject_job for job %d to controller", job_id)
+            except Exception as e:
+                logger.error("Failed to send reject_job for job %d: %s", job_id, e)
+
+    def _on_job_finished(self) -> None:
+        """Triggered when any job completes or terminates, immediately checking for more pending jobs."""
+        if self._current_ws is not None:
+            asyncio.create_task(self._check_and_pull_job(self._current_ws))
 
     async def start(self) -> None:
         """Start the WebSocket connection loop with automatic reconnect and exponential backoff."""
@@ -59,16 +87,19 @@ class AgentWebSocketClient:
                     backoff = 1.0
                     logger.info("Connected to controller WebSocket successfully")
 
-                    # Run heartbeat sender and incoming message consumer concurrently
+                    # Run heartbeat sender, pull loop, and incoming message consumer concurrently
                     heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+                    pull_task = asyncio.create_task(self._pull_loop(ws))
                     try:
                         await self._message_loop(ws)
                     finally:
                         heartbeat_task.cancel()
-                        try:
-                            await heartbeat_task
-                        except asyncio.CancelledError:
-                            pass
+                        pull_task.cancel()
+                        for t in (heartbeat_task, pull_task):
+                            try:
+                                await t
+                            except asyncio.CancelledError:
+                                pass
 
             except (ConnectionClosed, OSError) as exc:
                 if not self._running:
@@ -133,6 +164,55 @@ class AgentWebSocketClient:
         await ws.send(json.dumps(heartbeat_msg))
         logger.debug("Heartbeat sent: %s", payload)
 
+    async def _pull_loop(self, ws: websockets.ClientConnection) -> None:
+        """Periodically check capacity and pull available pending jobs."""
+        pull_interval = float(getattr(self.config, "pull_interval", 2.0))
+        while self._running:
+            try:
+                await self._check_and_pull_job(ws)
+            except Exception as exc:
+                logger.warning("Error in pull loop: %s", exc)
+
+            await asyncio.sleep(pull_interval)
+
+    async def _check_and_pull_job(self, ws: websockets.ClientConnection) -> None:
+        """Proactively query controller for pending jobs when node capacity and resources allow."""
+        if not self._running:
+            return
+
+        running_count = self.job_runner.get_running_jobs_count()
+        if running_count >= self.job_runner.max_concurrent_jobs:
+            return
+
+        # Resource check optimization:
+        # If running_jobs == 0: check resources
+        # If running_jobs > 0 and model is active: SKIP resource check!
+        if running_count == 0:
+            if not self.registry.check_resources_available():
+                logger.debug("Cannot pull job: insufficient resources to load or wake model")
+                return
+        elif not self.registry.is_model_active() and not self.registry.check_resources_available():
+            return
+
+        # Clean expired cooldowns
+        now = time.time()
+        expired = [jid for jid, exp in self._failed_jobs_cooldown.items() if exp <= now]
+        for jid in expired:
+            del self._failed_jobs_cooldown[jid]
+
+        supported_models = self.registry.list_available_models()
+        payload = {
+            "supported_models": supported_models,
+            "exclude_job_ids": list(self._failed_jobs_cooldown.keys()),
+        }
+        pull_msg = {
+            "type": "pull_job",
+            "action": "pull_job",
+            "payload": payload,
+        }
+        await ws.send(json.dumps(pull_msg))
+        logger.debug("Sent pull_job: %s", payload)
+
     async def _message_loop(self, ws: websockets.ClientConnection) -> None:
         """Receive and route signaling messages from controller."""
         async for raw_message in ws:
@@ -168,6 +248,18 @@ class AgentWebSocketClient:
 
         if effective_action == "dispatch_job":
             self.job_runner.run_job(payload)
+
+        elif effective_action == "pull_job_result":
+            job = payload.get("job")
+            if job and isinstance(job, dict) and job.get("job_id"):
+                logger.info("Received job %s from pull_job_result", job.get("job_id"))
+                self.job_runner.run_job(job)
+                if self.job_runner.get_running_jobs_count() < self.job_runner.max_concurrent_jobs:
+                    asyncio.create_task(self._check_and_pull_job(ws))
+
+        elif effective_action == "notify_pending_jobs":
+            logger.info("Received notify_pending_jobs from controller; triggering pull check")
+            asyncio.create_task(self._check_and_pull_job(ws))
 
         elif effective_action == "load_model":
             model_name = payload.get("model_name", "")

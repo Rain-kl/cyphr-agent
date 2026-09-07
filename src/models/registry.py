@@ -348,5 +348,42 @@ class ModelRegistry:
 
         return downloaded
 
+    def is_model_active(self) -> bool:
+        """Check if any loaded model is active (doing inference or awake with allocated KV cache)."""
+        for engine in self._loaded_engines.values():
+            if getattr(engine, "loaded", False):
+                if hasattr(engine, "is_active") and callable(engine.is_active):
+                    if engine.is_active():
+                        return True
+                elif not getattr(engine, "is_sleeping", True):
+                    return True
+        return False
+
+    def check_resources_available(self, model_name: str | None = None) -> bool:
+        """Check if resources are available to load or run the model."""
+        if self._current_mode == "cpu":
+            return True
+        if model_name and model_name in self._loaded_engines:
+            eng = self._loaded_engines[model_name]
+            if hasattr(eng, "check_resources_available") and callable(eng.check_resources_available):
+                return eng.check_resources_available()
+        # If any loaded engine is active, resources are available
+        if self.is_model_active():
+            return True
+        # Check loaded engines first
+        for eng in self._loaded_engines.values():
+            if hasattr(eng, "check_resources_available") and callable(eng.check_resources_available):
+                if eng.check_resources_available():
+                    return True
+        # If no model loaded, check if any GPU has MIN_LOAD_VRAM_MB
+        from .qwen3_asr import resolve_devices
+
+        try:
+            devs = resolve_devices("gpu")
+            return len(devs) > 0
+        except Exception:
+            return True
+
 
 default_registry = ModelRegistry()
+

@@ -17,6 +17,33 @@ from .base import BaseEngine
 
 logger = logging.getLogger(__name__)
 
+
+class InsufficientVRAMError(RuntimeError):
+    """Raised when GPU VRAM is insufficient to load the model or wake up to restore KV cache."""
+
+    pass
+
+
+MIN_LOAD_VRAM_MB = int(os.getenv("MIN_LOAD_VRAM_MB", "2048"))
+MIN_WAKE_VRAM_MB = int(os.getenv("MIN_WAKE_VRAM_MB", "1536"))
+
+
+def get_gpu_free_memory_mb(device_id: int | str) -> int:
+    """Get remaining free GPU VRAM in megabytes for a given device index."""
+    if str(device_id).lower() == "cpu":
+        return 1000000
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 1000000
+        dev_idx = int(device_id) if isinstance(device_id, int) or str(device_id).isdigit() else 0
+        free_bytes, _ = torch.cuda.mem_get_info(dev_idx)
+        return free_bytes // (1024 * 1024)
+    except Exception:
+        return 1000000
+
+
 MODEL_NAME_0_6B = "qwen3-asr-0.6b"
 MODEL_NAME_1_7B = "qwen3-asr-1.7b"
 MODEL_NAME = MODEL_NAME_0_6B
@@ -98,52 +125,73 @@ def resolve_device_and_dtype(work_mode: str = "gpu") -> tuple[str, Any, int]:
 
 
 def resolve_devices(work_mode: str = "gpu") -> list[int | str]:
-    """Resolve list of target inference device identifiers (GPU indices or 'cpu')."""
+    """Resolve list of target inference device identifiers (GPU indices or 'cpu'),
+    filtering out any GPU devices with insufficient free VRAM for model loading.
+    """
     import torch
 
     env_device = os.getenv("QWEN3_ASR_DEVICE", "").strip().lower()
     explicit_idx = os.getenv("CUDA_DEVICE_INDEX", "").strip()
 
+    candidate_devices: list[int | str]
     if env_device and env_device not in ("all", "multi", "gpu", "cuda"):
         if env_device == "cpu":
             return ["cpu"]
         if env_device.startswith("cuda:"):
             try:
-                return [int(env_device.split(":")[1])]
+                candidate_devices = [int(env_device.split(":")[1])]
             except ValueError:
-                return [0]
-        return [env_device]
-
-    if explicit_idx:
+                candidate_devices = [0]
+        else:
+            candidate_devices = [env_device]
+    elif explicit_idx:
         try:
-            return [int(explicit_idx)]
+            candidate_devices = [int(explicit_idx)]
         except ValueError:
-            pass
+            candidate_devices = [0]
+    else:
+        req_device = work_mode.strip().lower()
+        if req_device == "cpu":
+            return ["cpu"]
+        if req_device.startswith("cuda:"):
+            try:
+                candidate_devices = [int(req_device.split(":")[1])]
+            except ValueError:
+                candidate_devices = [0]
+        elif torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            if env_vis := os.getenv("CUDA_VISIBLE_DEVICES"):
+                parts = [p.strip() for p in env_vis.split(",") if p.strip()]
+                valid: list[int | str] = []
+                for p in parts:
+                    try:
+                        valid.append(int(p))
+                    except ValueError:
+                        pass
+                candidate_devices = valid if valid else list(range(torch.cuda.device_count()))
+            else:
+                candidate_devices = list(range(torch.cuda.device_count()))
+        else:
+            return ["cpu"]
 
-    req_device = work_mode.strip().lower()
-    if req_device == "cpu":
-        return ["cpu"]
+    # Filter candidate GPUs by free memory against MIN_LOAD_VRAM_MB
+    min_load_mb = int(os.getenv("MIN_LOAD_VRAM_MB", str(MIN_LOAD_VRAM_MB)))
+    available_devices: list[int | str] = []
+    for dev in candidate_devices:
+        if str(dev).lower() == "cpu":
+            available_devices.append(dev)
+        else:
+            free_mb = get_gpu_free_memory_mb(dev)
+            if free_mb >= min_load_mb:
+                available_devices.append(dev)
+            else:
+                logger.warning(
+                    "[resolve_devices] Skipping GPU %s: insufficient free VRAM (%d MB < %d MB required)",
+                    dev,
+                    free_mb,
+                    min_load_mb,
+                )
 
-    if req_device.startswith("cuda:"):
-        try:
-            return [int(req_device.split(":")[1])]
-        except ValueError:
-            return [0]
-
-    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-        if env_vis := os.getenv("CUDA_VISIBLE_DEVICES"):
-            parts = [p.strip() for p in env_vis.split(",") if p.strip()]
-            valid: list[int | str] = []
-            for p in parts:
-                try:
-                    valid.append(int(p))
-                except ValueError:
-                    pass
-            if valid:
-                return valid
-        return list(range(torch.cuda.device_count()))
-
-    return ["cpu"]
+    return available_devices
 
 
 def resolve_model_dir(model_name: str = MODEL_NAME) -> Path:
@@ -287,6 +335,11 @@ class Qwen3ASREngine(BaseEngine):
 
         model_source = self._resolve_model_source()
         devices = resolve_devices(work_mode)
+        if not devices:
+            min_load_mb = int(os.getenv("MIN_LOAD_VRAM_MB", str(MIN_LOAD_VRAM_MB)))
+            raise InsufficientVRAMError(
+                f"No GPU device has sufficient free VRAM to load model '{self.model_name}' (required: {min_load_mb} MB)"
+            )
 
         logger.info(
             "Initializing Qwen3-ASR vLLM engine for %s from %s on devices %s (gpu_util=%.2f, max_model_len=%d, batch_size=%d)...",
@@ -299,7 +352,12 @@ class Qwen3ASREngine(BaseEngine):
         )
 
         force_pool = os.getenv("VLLM_FORCE_WORKER_POOL", "").lower() in ("1", "true", "yes")
-        if len(devices) > 1 or force_pool:
+        use_worker_pool = (
+            len(devices) > 1
+            or force_pool
+            or (len(devices) == 1 and devices[0] not in (0, "0", "cpu"))
+        )
+        if use_worker_pool:
             from .worker import WorkerProxy
 
             with self._lock:
@@ -350,6 +408,30 @@ class Qwen3ASREngine(BaseEngine):
         except Exception as e:
             logger.warning("Failed during CUDA cache cleanup: %s", e)
 
+    def is_active(self) -> bool:
+        """Check if engine is active (performing inference or awake with KV cache allocated)."""
+        with self._lock:
+            if self._active_tasks > 0:
+                return True
+            if self._workers:
+                return any(not getattr(w, "is_sleeping", False) for w in self._workers)
+            return not self._is_sleeping
+
+    def check_resources_available(self) -> bool:
+        """Check if resources are available to load or wake up this engine."""
+        if not self.loaded:
+            devices = resolve_devices("gpu")
+            return len(devices) > 0
+        if self.is_active():
+            return True
+        min_wake_mb = int(os.getenv("MIN_WAKE_VRAM_MB", str(MIN_WAKE_VRAM_MB)))
+        if self._workers:
+            for w in self._workers:
+                if get_gpu_free_memory_mb(w.device_id) >= min_wake_mb:
+                    return True
+            return False
+        return get_gpu_free_memory_mb(0) >= min_wake_mb
+
     def transcribe(
         self,
         audio_path: str,
@@ -364,16 +446,53 @@ class Qwen3ASREngine(BaseEngine):
             if not os.path.isfile(audio_path):
                 raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
 
-            worker = self._worker_queue.get()
+            min_wake_mb = int(os.getenv("MIN_WAKE_VRAM_MB", str(MIN_WAKE_VRAM_MB)))
+            selected_worker = None
+
+            # Pre-wakeup probe: find candidate worker with sufficient VRAM to restore KV cache
+            with self._lock:
+                all_candidates = []
+                while not self._worker_queue.empty():
+                    try:
+                        all_candidates.append(self._worker_queue.get_nowait())
+                    except queue.Empty:
+                        break
+
+                for w in all_candidates:
+                    if getattr(w, "is_sleeping", False):
+                        free_mb = get_gpu_free_memory_mb(w.device_id)
+                        if free_mb < min_wake_mb:
+                            logger.warning(
+                                "[Pre-Wakeup Probe] Worker on device %s has insufficient free VRAM (%d MB < %d MB); skipping",
+                                w.device_id,
+                                free_mb,
+                                min_wake_mb,
+                            )
+                            continue
+                    selected_worker = w
+                    break
+
+                for w in all_candidates:
+                    if w is not selected_worker:
+                        self._worker_queue.put(w)
+
+            if selected_worker is None:
+                all_sleeping = all(getattr(w, "is_sleeping", False) for w in self._workers)
+                if all_sleeping:
+                    raise InsufficientVRAMError(
+                        f"All GPU workers have insufficient free VRAM to restore KV cache (required: {min_wake_mb} MB)"
+                    )
+                selected_worker = self._worker_queue.get(timeout=60.0)
+
             try:
-                return worker.execute_transcribe(
+                return selected_worker.execute_transcribe(
                     audio_path=audio_path,
                     language=language,
                     task_type=task_type,
                     log_callback=log_callback,
                 )
             finally:
-                self._worker_queue.put(worker)
+                self._worker_queue.put(selected_worker)
 
         from qwen_asr.inference.utils import (
             SAMPLE_RATE,
@@ -389,6 +508,12 @@ class Qwen3ASREngine(BaseEngine):
         with self._lock:
             self._cancel_sleep_timer_locked()
             if self._is_sleeping:
+                min_wake_mb = int(os.getenv("MIN_WAKE_VRAM_MB", str(MIN_WAKE_VRAM_MB)))
+                free_mb = get_gpu_free_memory_mb(0)
+                if free_mb < min_wake_mb:
+                    raise InsufficientVRAMError(
+                        f"GPU has insufficient free VRAM to restore KV cache ({free_mb} MB < {min_wake_mb} MB)"
+                    )
                 self._wake_up_locked()
             self._active_tasks += 1
 

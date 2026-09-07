@@ -7,6 +7,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -74,11 +75,15 @@ class JobRunner:
         registry: ModelRegistry,
         media_dir: str = "/tmp/transcribe/media",
         max_concurrent_jobs: int = 2,
+        on_job_rejected: Callable[[int, str], Any] | None = None,
+        on_job_finished: Callable[[], Any] | None = None,
     ) -> None:
         self.reporter = reporter
         self.registry = registry
         self.media_dir = media_dir
         self.max_concurrent_jobs = max_concurrent_jobs
+        self.on_job_rejected = on_job_rejected
+        self.on_job_finished = on_job_finished
         self._semaphore = DynamicSemaphore(max_concurrent_jobs)
         self._inference_lock = asyncio.Lock()
         self._active_tasks: dict[int, asyncio.Task[None]] = {}
@@ -107,6 +112,13 @@ class JobRunner:
 
         def _cleanup(_: asyncio.Task[None]) -> None:
             self._active_tasks.pop(job_id, None)
+            if self.on_job_finished is not None:
+                try:
+                    cb = self.on_job_finished()
+                    if asyncio.iscoroutine(cb):
+                        asyncio.create_task(cb)
+                except Exception as ex:
+                    logger.warning("Error in on_job_finished callback: %s", ex)
 
         task.add_done_callback(_cleanup)
         return task
@@ -240,8 +252,29 @@ class JobRunner:
                 logger.info("Job %d completed successfully in %.2fs", job_id, duration)
 
         except Exception as exc:
-            # Shielding: catch any exception, report failure, never crash agent
             duration = time.time() - start_time
+            from .models.qwen3_asr import InsufficientVRAMError
+
+            is_oom = (
+                isinstance(exc, InsufficientVRAMError)
+                or "out of memory" in str(exc).lower()
+                or "cuda error: out of memory" in str(exc).lower()
+                or type(exc).__name__ == "OutOfMemoryError"
+            )
+
+            if is_oom and self.on_job_rejected is not None:
+                logger.warning("Job %d rejected due to VRAM / OOM condition: %s", job_id, exc)
+                try:
+                    cb_res = self.on_job_rejected(job_id, str(exc))
+                    if asyncio.iscoroutine(cb_res):
+                        await cb_res
+                except Exception as reject_err:
+                    logger.error(
+                        "Error during on_job_rejected callback for job %d: %s", job_id, reject_err
+                    )
+                return
+
+            # Shielding: catch any exception, report failure, never crash agent
             logger.exception("Job %d execution encountered error: %s", job_id, exc)
             try:
                 await self.reporter.report_completion(

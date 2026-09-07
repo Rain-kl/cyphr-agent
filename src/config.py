@@ -43,6 +43,10 @@ class AgentConfig(BaseModel):
         default=0,
         description="Minutes of inactivity before auto-unloading models (0 to disable)",
     )
+    pull_interval: float = Field(
+        default=2.0,
+        description="Interval in seconds between proactive job pulls",
+    )
 
     @property
     def http_base_url(self) -> str:
@@ -124,6 +128,11 @@ def load_config(config_path: str | Path | None = None) -> AgentConfig:
     if env_auto_unload := os.getenv("AUTO_UNLOAD_MINUTES", os.getenv("MODEL_IDLE_UNLOAD_MINUTES")):
         try:
             data["auto_unload_minutes"] = int(env_auto_unload)
+        except ValueError:
+            pass
+    if env_pull := os.getenv("PULL_INTERVAL"):
+        try:
+            data["pull_interval"] = float(env_pull)
         except ValueError:
             pass
 
