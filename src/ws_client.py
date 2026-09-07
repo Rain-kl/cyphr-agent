@@ -33,6 +33,15 @@ class AgentWebSocketClient:
         self.job_runner = job_runner
         self._running = False
         self._current_ws: websockets.ClientConnection | None = None
+        self.registry.set_auto_unload_callback(self._on_models_auto_unloaded)
+
+    async def _on_models_auto_unloaded(self) -> None:
+        if self._current_ws is not None:
+            try:
+                await self._send_model_status(self._current_ws)
+                await self._send_heartbeat(self._current_ws)
+            except Exception as e:
+                logger.warning("Failed to report auto-unload status: %s", e)
 
     async def start(self) -> None:
         """Start the WebSocket connection loop with automatic reconnect and exponential backoff."""
@@ -217,6 +226,9 @@ class AgentWebSocketClient:
                     await self._send_model_status(ws)
                 except Exception as e:
                     logger.error("Failed to set work mode from set_config: %s", e)
+            auto_unload = payload.get("auto_unload_minutes")
+            if isinstance(auto_unload, int) and auto_unload >= 0:
+                self.registry.set_auto_unload_minutes(auto_unload)
             await self._send_heartbeat(ws)
 
     async def _send_model_status(self, ws: websockets.ClientConnection) -> None:

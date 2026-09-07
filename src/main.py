@@ -30,6 +30,8 @@ async def main() -> None:
 
     monitor = SystemMonitor()
     registry = ModelRegistry(debug=config.debug)
+    if config.auto_unload_minutes > 0:
+        registry.set_auto_unload_minutes(config.auto_unload_minutes)
     reporter = Reporter(
         base_url=config.http_base_url,
         agent_token=config.agent_token,

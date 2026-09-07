@@ -127,8 +127,63 @@ class Qwen3ASREngine(BaseEngine):
         self.batch_size = max(1, min(8, int(os.getenv("QWEN3_ASR_BATCH_SIZE", "4"))))
         self.gpu_memory_utilization = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.60"))
         self.max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", "16384"))
+        self.sleep_idle_seconds = float(os.getenv("VLLM_SLEEP_IDLE_SECONDS", "5.0"))
         self._model = None
         self._lock = threading.Lock()
+        self._sleep_timer: threading.Timer | None = None
+        self._is_sleeping = False
+        self._active_tasks = 0
+
+    @property
+    def is_sleeping(self) -> bool:
+        with self._lock:
+            return self._is_sleeping
+
+    def enter_sleep(self) -> None:
+        """Immediately enter Sleep Mode to offload KV cache without waiting for idle timer."""
+        self._enter_sleep()
+
+    def _cancel_sleep_timer_locked(self) -> None:
+        if self._sleep_timer is not None:
+            self._sleep_timer.cancel()
+            self._sleep_timer = None
+
+    def _arm_sleep_timer_locked(self) -> None:
+        self._cancel_sleep_timer_locked()
+        if self._model is not None and not self._is_sleeping and self._active_tasks == 0:
+            self._sleep_timer = threading.Timer(self.sleep_idle_seconds, self._enter_sleep)
+            self._sleep_timer.daemon = True
+            self._sleep_timer.start()
+
+    def _enter_sleep(self) -> None:
+        with self._lock:
+            if self._active_tasks > 0 or self._is_sleeping or self._model is None:
+                return
+            vllm_engine = getattr(self._model, "model", self._model)
+            sleep_fn = getattr(vllm_engine, "sleep", None)
+            if sleep_fn is not None:
+                try:
+                    logger.info(
+                        "vLLM engine idle for %.1fs; entering Sleep Mode (level=1) to offload KV cache...",
+                        self.sleep_idle_seconds,
+                    )
+                    sleep_fn(level=1)
+                    self._is_sleeping = True
+                except Exception as e:
+                    logger.warning("Error entering vLLM Sleep Mode: %s", e)
+
+    def _wake_up_locked(self) -> None:
+        if not self._is_sleeping:
+            return
+        vllm_engine = getattr(self._model, "model", self._model)
+        wake_fn = getattr(vllm_engine, "wake_up", None)
+        if wake_fn is not None:
+            try:
+                logger.info("Waking up vLLM engine from Sleep Mode...")
+                wake_fn()
+            except Exception as e:
+                logger.warning("Error waking up vLLM engine: %s", e)
+        self._is_sleeping = False
 
     async def load(self, work_mode: str = "gpu") -> None:
         """Load weights using vLLM engine."""
@@ -136,6 +191,8 @@ class Qwen3ASREngine(BaseEngine):
 
         await asyncio.to_thread(self._load_blocking, work_mode)
         self.loaded = True
+        with self._lock:
+            self._arm_sleep_timer_locked()
 
     def _load_blocking(self, work_mode: str = "gpu") -> None:
         from qwen_asr import Qwen3ASRModel
@@ -173,7 +230,11 @@ class Qwen3ASREngine(BaseEngine):
         )
 
     async def unload(self) -> None:
-        self._model = None
+        with self._lock:
+            self._cancel_sleep_timer_locked()
+            self._is_sleeping = False
+            self._model = None
+            self.loaded = False
         gc.collect()
         try:
             import torch
@@ -183,7 +244,6 @@ class Qwen3ASREngine(BaseEngine):
                 torch.cuda.ipc_collect()
         except Exception as e:
             logger.warning("Failed during CUDA cache cleanup: %s", e)
-        self.loaded = False
 
     def transcribe(
         self,
@@ -204,103 +264,115 @@ class Qwen3ASREngine(BaseEngine):
         if not os.path.isfile(audio_path):
             raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
 
-        lang = LANG_MAP.get(language, language) if language else None
-
-        def _log(progress: int, message: str) -> None:
-            if log_callback is None:
-                return
-            try:
-                log_callback(progress, message)
-            except Exception as e:
-                logger.warning("log_callback failed: %s", e)
-
-        _log(20, "Loading and decoding audio file...")
-        is_standard_audio = False
-        try:
-            import soundfile as sf
-
-            with sf.SoundFile(audio_path) as info:
-                if info.samplerate == TARGET_SR and info.channels == 1 and info.format in ("WAV", "MP3"):
-                    is_standard_audio = True
-        except Exception:
-            is_standard_audio = False
-
-        if is_standard_audio:
-            _log(30, "Direct audio feed detected (standard 16kHz mono audio), skipping ffmpeg conversion...")
-            wav = normalize_audio_input(audio_path)
-            chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
-        else:
-            try:
-                r = subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-hide_banner",
-                        "-nostdin",
-                        "-loglevel",
-                        "error",
-                        "-i",
-                        audio_path,
-                        "-vn",
-                        "-ac",
-                        "1",
-                        "-ar",
-                        str(TARGET_SR),
-                        "-f",
-                        "s16le",
-                        "pipe:1",
-                    ],
-                    capture_output=True,
-                )
-                if r.returncode != 0:
-                    err_msg = r.stderr.decode("utf-8", errors="replace").strip() if r.stderr else "unknown error"
-                    raise RuntimeError(f"ffmpeg failed for {audio_path}: {err_msg}")
-                _log(30, "Preprocessing audio chunks and extracting features...")
-                pcm_data = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
-                wav = normalize_audio_input((pcm_data, TARGET_SR))
-                chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
-            except FileNotFoundError as fnf_err:
-                raise RuntimeError(
-                    "未在当前系统中检测到 ffmpeg 可执行程序。请安装 ffmpeg 并加入系统 PATH，"
-                    "或者使用 cyphr 命令行客户端 (CLI) 在上传前自动完成音频格式转换。"
-                ) from fnf_err
-
-        duration = len(wav) / SAMPLE_RATE
-        total = len(chunks)
-        segments, texts, langs = [], [], []
-
-        _log(30, "Running vLLM ASR inference...")
         with self._lock:
-            for i in range(0, total, self.batch_size):
-                batch = chunks[i : i + self.batch_size]
-                cur_end = min(i + self.batch_size, total)
-                _log(30 + int(65 * cur_end / max(total, 1)), f"Running vLLM ASR inference ({cur_end}/{total})...")
+            self._cancel_sleep_timer_locked()
+            if self._is_sleeping:
+                self._wake_up_locked()
+            self._active_tasks += 1
 
-                audio_inputs = [(cwav, SAMPLE_RATE) for cwav, _ in batch]
-                outs = self._model.transcribe(audio=audio_inputs, language=lang)
+        try:
+            lang = LANG_MAP.get(language, language) if language else None
 
-                for (cwav, offset), out in zip(batch, outs):
-                    text = (out.text or "").strip()
-                    detected_lang = getattr(out, "language", None)
-                    if detected_lang and detected_lang not in langs:
-                        langs.append(detected_lang)
-                    if text:
-                        texts.append(text)
-                        segments.append(
-                            {
-                                "id": len(segments),
-                                "seek": int(offset * 100),
-                                "start": round(offset, 2),
-                                "end": round(offset + len(cwav) / SAMPLE_RATE, 2),
-                                "text": text,
-                            }
-                        )
+            def _log(progress: int, message: str) -> None:
+                if log_callback is None:
+                    return
+                try:
+                    log_callback(progress, message)
+                except Exception as e:
+                    logger.warning("log_callback failed: %s", e)
 
-        _log(100, "Aligning timestamps and finalizing transcript...")
-        return {
-            "task": task_type or "transcribe",
-            "language": langs[0] if langs else (lang or ""),
-            "duration": round(duration, 2),
-            "text": " ".join(texts),
-            "segments": segments,
-        }
+            _log(20, "Loading and decoding audio file...")
+            is_standard_audio = False
+            try:
+                import soundfile as sf
+
+                with sf.SoundFile(audio_path) as info:
+                    if info.samplerate == TARGET_SR and info.channels == 1 and info.format in ("WAV", "MP3"):
+                        is_standard_audio = True
+            except Exception:
+                is_standard_audio = False
+
+            if is_standard_audio:
+                _log(30, "Direct audio feed detected (standard 16kHz mono audio), skipping ffmpeg conversion...")
+                wav = normalize_audio_input(audio_path)
+                chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
+            else:
+                try:
+                    r = subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-hide_banner",
+                            "-nostdin",
+                            "-loglevel",
+                            "error",
+                            "-i",
+                            audio_path,
+                            "-vn",
+                            "-ac",
+                            "1",
+                            "-ar",
+                            str(TARGET_SR),
+                            "-f",
+                            "s16le",
+                            "pipe:1",
+                        ],
+                        capture_output=True,
+                    )
+                    if r.returncode != 0:
+                        err_msg = r.stderr.decode("utf-8", errors="replace").strip() if r.stderr else "unknown error"
+                        raise RuntimeError(f"ffmpeg failed for {audio_path}: {err_msg}")
+                    _log(30, "Preprocessing audio chunks and extracting features...")
+                    pcm_data = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+                    wav = normalize_audio_input((pcm_data, TARGET_SR))
+                    chunks = split_audio_into_chunks(wav, SAMPLE_RATE, max_chunk_sec=CHUNK_SEC)
+                except FileNotFoundError as fnf_err:
+                    raise RuntimeError(
+                        "未在当前系统中检测到 ffmpeg 可执行程序。请安装 ffmpeg 并加入系统 PATH，"
+                        "或者使用 cyphr 命令行客户端 (CLI) 在上传前自动完成音频格式转换。"
+                    ) from fnf_err
+
+            duration = len(wav) / SAMPLE_RATE
+            total = len(chunks)
+            segments, texts, langs = [], [], []
+
+            _log(30, "Running vLLM ASR inference...")
+            with self._lock:
+                for i in range(0, total, self.batch_size):
+                    batch = chunks[i : i + self.batch_size]
+                    cur_end = min(i + self.batch_size, total)
+                    _log(30 + int(65 * cur_end / max(total, 1)), f"Running vLLM ASR inference ({cur_end}/{total})...")
+
+                    audio_inputs = [(cwav, SAMPLE_RATE) for cwav, _ in batch]
+                    outs = self._model.transcribe(audio=audio_inputs, language=lang)
+
+                    for (cwav, offset), out in zip(batch, outs):
+                        text = (out.text or "").strip()
+                        detected_lang = getattr(out, "language", None)
+                        if detected_lang and detected_lang not in langs:
+                            langs.append(detected_lang)
+                        if text:
+                            texts.append(text)
+                            segments.append(
+                                {
+                                    "id": len(segments),
+                                    "seek": int(offset * 100),
+                                    "start": round(offset, 2),
+                                    "end": round(offset + len(cwav) / SAMPLE_RATE, 2),
+                                    "text": text,
+                                }
+                            )
+
+            _log(100, "Aligning timestamps and finalizing transcript...")
+            return {
+                "task": task_type or "transcribe",
+                "language": langs[0] if langs else (lang or ""),
+                "duration": round(duration, 2),
+                "text": " ".join(texts),
+                "segments": segments,
+            }
+        finally:
+            with self._lock:
+                self._active_tasks = max(0, self._active_tasks - 1)
+                if self._active_tasks == 0:
+                    self._arm_sleep_timer_locked()

@@ -1443,3 +1443,240 @@ def test_qwen3_asr_vllm_transcribe_thread_safe_lock(tmp_path: Path) -> None:
     assert all("vllm transcribed text" in r["text"] for r in results)
     # The lock must guarantee max concurrent inside transcribe loop is 1
     assert max_concurrent_observed == 1
+
+
+def test_qwen3_asr_sleep_mode_on_idle_and_auto_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify engine automatically enters Sleep Mode when idle and wakes up on new task."""
+    import time
+
+    import numpy as np
+    import soundfile as sf
+
+    from src.models.qwen3_asr import Qwen3ASREngine
+
+    dummy_audio = tmp_path / "test_sleep.wav"
+    samplerate = 16000
+    sf.write(str(dummy_audio), np.zeros(int(samplerate * 0.5), dtype=np.float32), samplerate)
+
+    monkeypatch.setenv("VLLM_SLEEP_IDLE_SECONDS", "0.1")
+    engine = Qwen3ASREngine("qwen3-asr-0.6b")
+    engine.loaded = True
+
+    mock_llm = MagicMock()
+    mock_llm.sleep = MagicMock()
+    mock_llm.wake_up = MagicMock()
+
+    mock_model = MagicMock()
+    mock_model.model = mock_llm
+
+    def mock_transcribe(audio: list, language: str | None = None) -> list:
+        out = MagicMock()
+        out.text = "wake up test"
+        out.language = "en"
+        return [out]
+
+    mock_model.transcribe = mock_transcribe
+    engine._model = mock_model
+
+    # 1. Run transcription
+    res1 = engine.transcribe(str(dummy_audio))
+    assert res1["text"] == "wake up test"
+    assert engine.is_sleeping is False
+    assert mock_llm.sleep.call_count == 0
+
+    # 2. Wait for idle timeout (0.1s + buffer)
+    time.sleep(0.2)
+    assert engine.is_sleeping is True
+    assert mock_llm.sleep.call_count == 1
+    mock_llm.sleep.assert_called_with(level=1)
+
+    # 3. New task arrives while asleep -> auto wake-up
+    res2 = engine.transcribe(str(dummy_audio))
+    assert res2["text"] == "wake up test"
+    assert engine.is_sleeping is False
+    assert mock_llm.wake_up.call_count == 1
+
+
+def test_qwen3_asr_sleep_timer_cancelled_by_rapid_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify new request cancels pending sleep timer before it enters sleep mode."""
+    import time
+
+    import numpy as np
+    import soundfile as sf
+
+    from src.models.qwen3_asr import Qwen3ASREngine
+
+    dummy_audio = tmp_path / "test_rapid.wav"
+    samplerate = 16000
+    sf.write(str(dummy_audio), np.zeros(int(samplerate * 0.5), dtype=np.float32), samplerate)
+
+    monkeypatch.setenv("VLLM_SLEEP_IDLE_SECONDS", "0.3")
+    engine = Qwen3ASREngine("qwen3-asr-0.6b")
+    engine.loaded = True
+
+    mock_llm = MagicMock()
+    mock_llm.sleep = MagicMock()
+    mock_llm.wake_up = MagicMock()
+
+    mock_model = MagicMock()
+    mock_model.model = mock_llm
+
+    def mock_transcribe(audio: list, language: str | None = None) -> list:
+        out = MagicMock()
+        out.text = "rapid test"
+        out.language = "en"
+        return [out]
+
+    mock_model.transcribe = mock_transcribe
+    engine._model = mock_model
+
+    # Request 1
+    engine.transcribe(str(dummy_audio))
+    assert mock_llm.sleep.call_count == 0
+
+    # Wait 0.1s (timer is armed for 0.3s)
+    time.sleep(0.1)
+    assert mock_llm.sleep.call_count == 0
+
+    # Request 2 arrives before timer expires -> resets timer
+    engine.transcribe(str(dummy_audio))
+    assert mock_llm.sleep.call_count == 0
+
+    # Wait another 0.1s
+    time.sleep(0.1)
+    assert mock_llm.sleep.call_count == 0
+    assert engine.is_sleeping is False
+
+    # Wait for timer to finally expire (0.3s from Request 2 + buffer)
+    time.sleep(0.3)
+    assert mock_llm.sleep.call_count == 1
+    assert engine.is_sleeping is True
+
+
+def test_qwen3_asr_enter_sleep_and_default_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify default sleep_idle_seconds is 5.0 and enter_sleep triggers immediate sleep."""
+    from src.models.qwen3_asr import Qwen3ASREngine
+
+    monkeypatch.delenv("VLLM_SLEEP_IDLE_SECONDS", raising=False)
+    engine = Qwen3ASREngine("qwen3-asr-0.6b")
+    assert engine.sleep_idle_seconds == 5.0
+
+    mock_llm = MagicMock()
+    mock_llm.sleep = MagicMock()
+    mock_model = MagicMock()
+    mock_model.model = mock_llm
+    engine._model = mock_model
+    engine.loaded = True
+
+    assert engine.is_sleeping is False
+    engine.enter_sleep()
+    assert engine.is_sleeping is True
+    mock_llm.sleep.assert_called_once_with(level=1)
+
+
+@pytest.mark.asyncio
+async def test_registry_preemptively_sleeps_idle_models_on_new_model() -> None:
+    """Verify acquiring a new model immediately offloads the KV cache of idle loaded models."""
+    from src.models.registry import ModelRegistry
+
+    registry = ModelRegistry()
+
+    m1 = MagicMock()
+    m1.loaded = True
+    m1.load = AsyncMock()
+    m1.enter_sleep = MagicMock()
+
+    m2 = MagicMock()
+    m2.loaded = True
+    m2.load = AsyncMock()
+    m2.enter_sleep = MagicMock()
+
+    registry.register("model-1", lambda: m1)
+    registry.register("model-2", lambda: m2)
+
+    # Acquire model-1 first
+    async with registry.acquire_engine("model-1") as eng1:
+        assert eng1 is m1
+        assert m1.enter_sleep.call_count == 0
+
+    # Model-1 is now idle (0 active inferences). Now acquire model-2
+    async with registry.acquire_engine("model-2") as eng2:
+        assert eng2 is m2
+        # m1 must have been immediately put to sleep!
+        assert m1.enter_sleep.call_count == 1
+        assert m2.enter_sleep.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_registry_local_idle_auto_unload() -> None:
+    """Verify local idle timer unloads all models when no tasks run for auto_unload duration."""
+    from src.models.registry import ModelRegistry
+
+    registry = ModelRegistry()
+    registry._idle_unload_delay = 0.1  # Test delay in seconds
+    registry.set_auto_unload_minutes(1)
+
+    callback_called = False
+
+    async def on_unloaded() -> None:
+        nonlocal callback_called
+        callback_called = True
+
+    registry.set_auto_unload_callback(on_unloaded)
+
+    m1 = MagicMock()
+    m1.loaded = True
+    unload_called = False
+
+    async def mock_unload() -> None:
+        nonlocal unload_called
+        unload_called = True
+        m1.loaded = False
+
+    m1.unload = mock_unload
+    registry.register("auto-unload-model", lambda: m1)
+
+    # Load model
+    await registry.load_model("auto-unload-model")
+    assert "auto-unload-model" in registry.list_loaded_models()
+
+    # Wait for idle unload to trigger
+    await asyncio.sleep(0.2)
+    assert unload_called is True
+    assert callback_called is True
+    assert len(registry.list_loaded_models()) == 0
+
+
+@pytest.mark.asyncio
+async def test_ws_client_set_config_updates_auto_unload_minutes() -> None:
+    """Verify set_config updates registry.auto_unload_minutes and triggers heartbeat."""
+    from src.ws_client import AgentWebSocketClient
+
+    config = AgentConfig()
+    monitor = MagicMock()
+    monitor.collect.return_value = {}
+    registry = ModelRegistry()
+    job_runner = MagicMock()
+    job_runner.get_running_jobs_count.return_value = 0
+
+    client = AgentWebSocketClient(config, monitor, registry, job_runner)
+
+    mock_ws = AsyncMock()
+    set_cfg_msg = {
+        "type": "command",
+        "action": "set_config",
+        "payload": {
+            "max_concurrent_jobs": 4,
+            "auto_unload_minutes": 15,
+        },
+    }
+
+    await client._handle_message(mock_ws, set_cfg_msg)
+
+    assert registry.get_auto_unload_minutes() == 15
+    job_runner.set_max_concurrent_jobs.assert_called_once_with(4)
+    assert mock_ws.send.call_count >= 1

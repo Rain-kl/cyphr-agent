@@ -39,6 +39,10 @@ class AgentConfig(BaseModel):
         default=False,
         description="Enable debug mode (allows mock models for testing)",
     )
+    auto_unload_minutes: int = Field(
+        default=0,
+        description="Minutes of inactivity before auto-unloading models (0 to disable)",
+    )
 
     @property
     def http_base_url(self) -> str:
@@ -117,5 +121,10 @@ def load_config(config_path: str | Path | None = None) -> AgentConfig:
             pass
     if env_debug := os.getenv("DEBUG", os.getenv("AGENT_DEBUG")):
         data["debug"] = env_debug.lower() in ("true", "1", "yes", "on")
+    if env_auto_unload := os.getenv("AUTO_UNLOAD_MINUTES", os.getenv("MODEL_IDLE_UNLOAD_MINUTES")):
+        try:
+            data["auto_unload_minutes"] = int(env_auto_unload)
+        except ValueError:
+            pass
 
     return AgentConfig(**data)

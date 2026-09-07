@@ -6,6 +6,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
 from .base import BaseEngine
 from .mock_asr import MockASREngine
@@ -52,6 +53,10 @@ class ModelRegistry:
         self._registry_lock = asyncio.Lock()
         self._inference_counts: dict[str, int] = {}
         self._drain_events: dict[str, asyncio.Event] = {}
+        self._auto_unload_minutes: int = int(os.getenv("AUTO_UNLOAD_MINUTES", os.getenv("MODEL_IDLE_UNLOAD_MINUTES", "0")))
+        self._idle_unload_delay: float | None = None
+        self._auto_unload_callback: Callable[[], Any] | None = None
+        self._idle_unload_task: asyncio.Task[None] | None = None
 
         if debug is None:
             env_debug = os.getenv("DEBUG", os.getenv("AGENT_DEBUG", "")).lower()
@@ -112,11 +117,16 @@ class ModelRegistry:
     async def _load_model_unlocked(self, model_name: str) -> BaseEngine:
         if model_name in self._loaded_engines:
             engine = self._loaded_engines[model_name]
-            if not engine.loaded:
-                try:
-                    await engine.load(work_mode=self._current_mode)
-                except TypeError:
-                    await engine.load()
+            if not getattr(engine, "loaded", False):
+                if hasattr(engine, "load") and callable(engine.load):
+                    try:
+                        res = engine.load(work_mode=self._current_mode)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except TypeError:
+                        res = engine.load()
+                        if asyncio.iscoroutine(res):
+                            await res
             return engine
 
         if model_name not in self._factories:
@@ -125,13 +135,78 @@ class ModelRegistry:
             raise ValueError(f"Unknown or unregistered model: {model_name}")
 
         engine = self._factories[model_name]()
-        try:
-            await engine.load(work_mode=self._current_mode)
-        except TypeError:
-            await engine.load()
+        if not getattr(engine, "loaded", False):
+            if hasattr(engine, "load") and callable(engine.load):
+                try:
+                    res = engine.load(work_mode=self._current_mode)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except TypeError:
+                    res = engine.load()
+                    if asyncio.iscoroutine(res):
+                        await res
         self._loaded_engines[model_name] = engine
         logger.info("Loaded model '%s' (mode=%s)", model_name, self._current_mode)
         return engine
+
+    def set_auto_unload_minutes(self, minutes: int) -> None:
+        """Set idle duration in minutes before automatically unloading all models (0 disables)."""
+        self._auto_unload_minutes = max(0, minutes)
+        logger.info("Updated model registry auto_unload_minutes to %d", self._auto_unload_minutes)
+        if self._auto_unload_minutes == 0 and self._idle_unload_delay is None:
+            self._cancel_idle_unload_timer()
+        else:
+            self._check_and_schedule_idle_unload()
+
+    def get_auto_unload_minutes(self) -> int:
+        return self._auto_unload_minutes
+
+    def set_auto_unload_callback(self, cb: Callable[[], Any] | None) -> None:
+        """Register a callback (sync or async) invoked after models are auto-unloaded."""
+        self._auto_unload_callback = cb
+
+    def _cancel_idle_unload_timer(self) -> None:
+        if self._idle_unload_task is not None and not self._idle_unload_task.done():
+            self._idle_unload_task.cancel()
+            self._idle_unload_task = None
+
+    def _check_and_schedule_idle_unload(self) -> None:
+        if self._auto_unload_minutes <= 0 and self._idle_unload_delay is None:
+            self._cancel_idle_unload_timer()
+            return
+        if sum(self._inference_counts.values()) > 0:
+            self._cancel_idle_unload_timer()
+            return
+        if not any(getattr(eng, "loaded", False) for eng in self._loaded_engines.values()):
+            self._cancel_idle_unload_timer()
+            return
+
+        delay = self._idle_unload_delay if self._idle_unload_delay is not None else float(self._auto_unload_minutes * 60)
+        self._cancel_idle_unload_timer()
+
+        async def _idle_worker() -> None:
+            try:
+                await asyncio.sleep(delay)
+                logger.info(
+                    "ModelRegistry idle for %.1fs (threshold: %d min); auto-unloading all models to free GPU...",
+                    delay,
+                    self._auto_unload_minutes,
+                )
+                unloaded = await self.unload_all_models()
+                if unloaded and self._auto_unload_callback is not None:
+                    cb_res = self._auto_unload_callback()
+                    if asyncio.iscoroutine(cb_res):
+                        await cb_res
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Error during model auto-unload: %s", e)
+
+        try:
+            loop = asyncio.get_running_loop()
+            self._idle_unload_task = loop.create_task(_idle_worker())
+        except RuntimeError:
+            pass
 
     @asynccontextmanager
     async def acquire_engine(self, model_name: str) -> AsyncIterator[BaseEngine]:
@@ -139,8 +214,19 @@ class ModelRegistry:
 
         Guarantees the model cannot be concurrently unloaded while the context block is executing.
         """
+        self._cancel_idle_unload_timer()
         lock = self._get_load_lock(model_name)
         async with lock:
+            # Preemptively offload KV cache of any other loaded models that are currently idle
+            async with self._registry_lock:
+                for name, eng in self._loaded_engines.items():
+                    if name != model_name and self._inference_counts.get(name, 0) == 0:
+                        if hasattr(eng, "enter_sleep") and callable(eng.enter_sleep):
+                            try:
+                                eng.enter_sleep()
+                            except Exception as e:
+                                logger.warning("Failed to enter sleep for idle engine %s: %s", name, e)
+
             engine = await self._load_model_unlocked(model_name)
             async with self._registry_lock:
                 self._inference_counts[model_name] = self._inference_counts.get(model_name, 0) + 1
@@ -156,12 +242,15 @@ class ModelRegistry:
                         event.set()
                 else:
                     self._inference_counts[model_name] = count
+            self._check_and_schedule_idle_unload()
 
     async def load_model(self, model_name: str) -> BaseEngine:
         """Load and cache an engine instance by model name using current work mode with concurrency lock."""
         lock = self._get_load_lock(model_name)
         async with lock:
-            return await self._load_model_unlocked(model_name)
+            eng = await self._load_model_unlocked(model_name)
+            self._check_and_schedule_idle_unload()
+            return eng
 
     async def unload_model(self, model_name: str, timeout: float = 30.0) -> bool:
         """Unload and remove an engine instance safely after active inferences have drained."""
@@ -195,7 +284,9 @@ class ModelRegistry:
                 await engine.unload()
                 del self._loaded_engines[model_name]
                 logger.info("Unloaded model '%s'", model_name)
+                self._check_and_schedule_idle_unload()
                 return True
+            self._check_and_schedule_idle_unload()
             return False
 
     async def unload_all_models(self, timeout: float = 30.0) -> list[str]:
@@ -214,6 +305,7 @@ class ModelRegistry:
                 torch.cuda.empty_cache()
         except Exception:
             pass
+        self._check_and_schedule_idle_unload()
         logger.info("Unloaded all models: %s", unloaded)
         return unloaded
 
