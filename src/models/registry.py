@@ -8,6 +8,8 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
+from ..core.engine import BaseModelEngine
+from ..resources.hardware import detect_supported_modes, resolve_devices
 from .base import BaseEngine
 from .mock_asr import MockASREngine
 from .qwen3_asr import (
@@ -20,35 +22,12 @@ from .qwen3_asr import (
 logger = logging.getLogger(__name__)
 
 
-def detect_supported_modes() -> tuple[list[str], str]:
-    """Detect available acceleration hardware and multi-GPU devices."""
-    modes = ["cpu"]
-    default_mode = "cpu"
-    try:
-        import torch
-
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            modes.append("gpu")
-            count = torch.cuda.device_count()
-            for idx in range(count):
-                modes.append(f"cuda:{idx}")
-            default_mode = "gpu"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            modes.append("gpu")
-            modes.append("mps")
-            default_mode = "gpu"
-    except Exception:
-        pass
-
-    return modes, default_mode
-
-
 class ModelRegistry:
     """Registry managing available ASR engine factories and loaded engine instances."""
 
     def __init__(self, preload_default: bool = False, debug: bool | None = None) -> None:
-        self._factories: dict[str, Callable[[], BaseEngine]] = {}
-        self._loaded_engines: dict[str, BaseEngine] = {}
+        self._factories: dict[str, Callable[[], BaseModelEngine]] = {}
+        self._loaded_engines: dict[str, BaseModelEngine] = {}
         self._load_locks: dict[str, asyncio.Lock] = {}
         self._registry_lock = asyncio.Lock()
         self._inference_counts: dict[str, int] = {}
@@ -105,7 +84,7 @@ class ModelRegistry:
             # Unload all models so future loads use the new device mode
             await self.unload_all_models()
 
-    def register(self, model_name: str, factory: Callable[[], BaseEngine]) -> None:
+    def register(self, model_name: str, factory: Callable[[], BaseModelEngine]) -> None:
         """Register a model factory."""
         self._factories[model_name] = factory
 
@@ -114,7 +93,7 @@ class ModelRegistry:
             self._load_locks[model_name] = asyncio.Lock()
         return self._load_locks[model_name]
 
-    async def _load_model_unlocked(self, model_name: str) -> BaseEngine:
+    async def _load_model_unlocked(self, model_name: str) -> BaseModelEngine:
         if model_name in self._loaded_engines:
             engine = self._loaded_engines[model_name]
             if not getattr(engine, "loaded", False):
@@ -209,7 +188,7 @@ class ModelRegistry:
             pass
 
     @asynccontextmanager
-    async def acquire_engine(self, model_name: str) -> AsyncIterator[BaseEngine]:
+    async def acquire_engine(self, model_name: str) -> AsyncIterator[BaseModelEngine]:
         """Safely acquire an engine instance for inference with active reference counting.
 
         Guarantees the model cannot be concurrently unloaded while the context block is executing.
@@ -244,7 +223,7 @@ class ModelRegistry:
                     self._inference_counts[model_name] = count
             self._check_and_schedule_idle_unload()
 
-    async def load_model(self, model_name: str) -> BaseEngine:
+    async def load_model(self, model_name: str) -> BaseModelEngine:
         """Load and cache an engine instance by model name using current work mode with concurrency lock."""
         lock = self._get_load_lock(model_name)
         async with lock:
@@ -309,7 +288,7 @@ class ModelRegistry:
         logger.info("Unloaded all models: %s", unloaded)
         return unloaded
 
-    def get_engine(self, model_name: str) -> BaseEngine | None:
+    def get_engine(self, model_name: str) -> BaseModelEngine | None:
         """Retrieve a currently loaded engine instance, if any."""
         return self._loaded_engines.get(model_name)
 
@@ -376,8 +355,6 @@ class ModelRegistry:
                 if eng.check_resources_available():
                     return True
         # If no model loaded, check if any GPU has MIN_LOAD_VRAM_MB
-        from .qwen3_asr import resolve_devices
-
         try:
             devs = resolve_devices("gpu")
             return len(devs) > 0

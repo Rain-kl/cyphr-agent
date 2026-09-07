@@ -110,38 +110,7 @@ def _process_audio_chunks(audio_path: str) -> tuple[np.ndarray, list[tuple[np.nd
     return wav, chunks
 
 
-def calculate_dynamic_gpu_utilization(
-    device_id: int | str,
-    gpu_memory_utilization: float,
-    free_ratio: float = 0.70,
-    mock_free_bytes: int | None = None,
-    mock_total_bytes: int | None = None,
-) -> float:
-    """Calculate effective vLLM gpu_memory_utilization based on remaining free VRAM.
-
-    Prevents OOM when other processes (e.g. training jobs) occupy parts of the GPU memory.
-    """
-    if str(device_id).lower() == "cpu":
-        return gpu_memory_utilization
-
-    try:
-        if mock_free_bytes is not None and mock_total_bytes is not None:
-            free_bytes, total_bytes = mock_free_bytes, mock_total_bytes
-        else:
-            import torch
-
-            if not torch.cuda.is_available():
-                return gpu_memory_utilization
-            dev_idx = int(device_id) if isinstance(device_id, int) or str(device_id).isdigit() else 0
-            free_bytes, total_bytes = torch.cuda.mem_get_info(dev_idx)
-
-        if total_bytes > 0:
-            target_util = (free_bytes * free_ratio) / total_bytes
-            return min(gpu_memory_utilization, max(0.15, target_util))
-    except Exception as e:
-        logger.warning("Failed to compute dynamic GPU memory utilization for device %s: %s", device_id, e)
-
-    return gpu_memory_utilization
+from ..resources.vram import calculate_dynamic_gpu_utilization
 
 
 def asr_worker_process_main(
@@ -356,8 +325,11 @@ def asr_worker_process_main(
     logger.info("[Worker Device %s] Child process exiting cleanly...", device_id)
 
 
-class WorkerProxy:
-    """Manages child worker process lifecycle and communication."""
+from ..workers.proxy import BaseWorkerProxy
+
+
+class WorkerProxy(BaseWorkerProxy):
+    """Manages child worker process lifecycle and communication for ASR inference."""
 
     def __init__(
         self,
@@ -370,13 +342,9 @@ class WorkerProxy:
         enforce_eager: bool,
         sleep_idle_seconds: float,
     ) -> None:
-        self.device_id = device_id
-        self.is_sleeping = False
-        ctx = mp.get_context("spawn")
-        self.cmd_queue = ctx.Queue()
-        self.resp_queue = ctx.Queue()
-        self.process = ctx.Process(
-            target=asr_worker_process_main,
+        super().__init__(
+            device_id=device_id,
+            target_fn=asr_worker_process_main,
             args=(
                 device_id,
                 model_source,
@@ -386,28 +354,8 @@ class WorkerProxy:
                 batch_size,
                 enforce_eager,
                 sleep_idle_seconds,
-                self.cmd_queue,
-                self.resp_queue,
             ),
-            daemon=True,
         )
-        self.process.start()
-
-    def wait_ready(self, timeout: float = 60.0) -> None:
-        """Wait for worker process to signal ready."""
-        start = time.time()
-        while time.time() - start < timeout:
-            if not self.process.is_alive():
-                raise RuntimeError(f"Worker process for device {self.device_id} terminated unexpectedly during initialization")
-            try:
-                msg = self.resp_queue.get(timeout=1.0)
-                if msg[0] == "ready":
-                    return
-                if msg[0] == "error":
-                    raise RuntimeError(f"Worker init error on device {self.device_id}: {msg[2]}")
-            except Exception:
-                continue
-        raise TimeoutError(f"Worker for device {self.device_id} timed out after {timeout}s waiting for ready")
 
     def execute_transcribe(
         self,
@@ -425,7 +373,9 @@ class WorkerProxy:
         start = time.time()
         while time.time() - start < timeout:
             if not self.process.is_alive():
-                raise RuntimeError(f"Worker for device {self.device_id} died while executing transcription {task_id}")
+                raise RuntimeError(
+                    f"Worker for device {self.device_id} died while executing transcription {task_id}"
+                )
             try:
                 msg = self.resp_queue.get(timeout=1.0)
             except Exception:
@@ -444,22 +394,3 @@ class WorkerProxy:
                 raise RuntimeError(f"Worker device {self.device_id} error: {msg[2]}")
 
         raise TimeoutError(f"Transcription on device {self.device_id} timed out after {timeout}s")
-
-    def enter_sleep(self) -> None:
-        self.is_sleeping = True
-        if self.process.is_alive():
-            try:
-                self.cmd_queue.put(("sleep",))
-            except Exception:
-                pass
-
-    def stop(self, timeout: float = 3.0) -> None:
-        self.is_sleeping = True
-        if self.process.is_alive():
-            try:
-                self.cmd_queue.put(("stop",))
-            except Exception:
-                pass
-            self.process.join(timeout=timeout)
-            if self.process.is_alive():
-                self.process.kill()

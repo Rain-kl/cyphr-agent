@@ -1,27 +1,15 @@
 # Copyright 2026 Arctel.net
 # SPDX-License-Identifier: Apache-2.0
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections.abc import Callable
 from typing import Any
 
+from ..core.engine import BaseModelEngine
 
-class BaseEngine(ABC):
+
+class BaseASREngine(BaseModelEngine):
     """Abstract base class for all ASR model inference engines."""
-
-    supports_concurrent_inference: bool = False
-
-    def __init__(self, model_name: str) -> None:
-        self.model_name = model_name
-        self.loaded = False
-
-    @abstractmethod
-    async def load(self, work_mode: str = "gpu") -> None:
-        """Load model weights and initialize inference resources."""
-
-    @abstractmethod
-    async def unload(self) -> None:
-        """Unload model and free GPU/CPU memory."""
 
     @abstractmethod
     async def transcribe(
@@ -42,3 +30,7 @@ class BaseEngine(ABC):
         Returns:
             OpenAI verbose_json compliant dictionary.
         """
+
+
+# Backwards compatibility alias
+BaseEngine = BaseASREngine
