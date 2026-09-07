@@ -13,10 +13,26 @@ dependencies = [
     "qwen-asr",
     "torch",
     "huggingface-hub",
-    "vllm>=0.14.0",
-    "numpy>=2.3.5",
+    "vllm>=0.8.0",
+    "numpy",
     "soundfile>=0.14.0",
     "nvidia-ml-py>=13.610.43",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
 ]
 
 [dependency-groups]
