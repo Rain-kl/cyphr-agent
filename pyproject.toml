@@ -14,6 +14,9 @@ dependencies = [
     "torch",
     "huggingface-hub",
     "vllm>=0.14.0",
+    "numpy>=2.3.5",
+    "soundfile>=0.14.0",
+    "nvidia-ml-py>=13.610.43",
 ]
 
 [dependency-groups]
