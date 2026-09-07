@@ -1379,6 +1379,7 @@ def test_qwen3_asr_vllm_load_blocking_instantiation(
             return mock_inst
 
     monkeypatch.setattr("qwen_asr.Qwen3ASRModel", MockLLM)
+    monkeypatch.setattr("src.models.qwen3_asr.resolve_devices", lambda work_mode: [0])
 
     engine = Qwen3ASREngine("qwen3-asr-0.6b", model_dir=model_dir)
     engine._load_blocking(work_mode="gpu")
@@ -1680,3 +1681,141 @@ async def test_ws_client_set_config_updates_auto_unload_minutes() -> None:
     assert registry.get_auto_unload_minutes() == 15
     job_runner.set_max_concurrent_jobs.assert_called_once_with(4)
     assert mock_ws.send.call_count >= 1
+
+
+def test_resolve_devices_cpu_and_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify resolve_devices parses CPU, explicit CUDA index, CUDA_VISIBLE_DEVICES, and multi-device counts."""
+    from src.models.qwen3_asr import resolve_devices
+
+    monkeypatch.delenv("QWEN3_ASR_DEVICE", raising=False)
+    monkeypatch.delenv("CUDA_DEVICE_INDEX", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    # 1. Explicit cpu
+    assert resolve_devices("cpu") == ["cpu"]
+
+    # 2. Explicit cuda:1
+    assert resolve_devices("cuda:1") == [1]
+
+    # 3. Environment QWEN3_ASR_DEVICE
+    monkeypatch.setenv("QWEN3_ASR_DEVICE", "cuda:2")
+    assert resolve_devices("gpu") == [2]
+    monkeypatch.delenv("QWEN3_ASR_DEVICE", raising=False)
+
+    # 4. Environment CUDA_DEVICE_INDEX
+    monkeypatch.setenv("CUDA_DEVICE_INDEX", "3")
+    assert resolve_devices("gpu") == [3]
+    monkeypatch.delenv("CUDA_DEVICE_INDEX", raising=False)
+
+    # 5. CUDA_VISIBLE_DEVICES list
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0, 1")
+    assert resolve_devices("gpu") == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_qwen3_asr_multi_gpu_worker_pool_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify multi-device worker pool initialization, round-robin dispatch, sleep, and unload."""
+    import json
+
+    from src.models.qwen3_asr import Qwen3ASREngine
+
+    dummy_audio = tmp_path / "pool_test.wav"
+    dummy_audio.write_bytes(b"dummy")
+
+    model_dir = tmp_path / "mock_qwen3_pool"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "qwen3_asr"}))
+
+    created_proxies = []
+
+    class MockWorkerProxy:
+        def __init__(self, device_id, **kwargs):
+            self.device_id = device_id
+            self.kwargs = kwargs
+            self.wait_ready_called = False
+            self.sleep_called = False
+            self.stop_called = False
+            created_proxies.append(self)
+
+        def wait_ready(self, timeout: float = 60.0):
+            self.wait_ready_called = True
+
+        def execute_transcribe(self, audio_path, language, task_type, log_callback=None):
+            return {
+                "text": f"device_{self.device_id}_transcribed",
+                "device": self.device_id,
+            }
+
+        def enter_sleep(self):
+            self.sleep_called = True
+
+        def stop(self, timeout: float = 3.0):
+            self.stop_called = True
+
+    monkeypatch.setattr("src.models.worker.WorkerProxy", MockWorkerProxy)
+    monkeypatch.setattr("src.models.qwen3_asr.resolve_devices", lambda wm: [0, 1])
+
+    engine = Qwen3ASREngine("qwen3-asr-0.6b", model_dir=model_dir)
+    await engine.load(work_mode="gpu")
+
+    assert len(created_proxies) == 2
+    assert created_proxies[0].device_id == 0
+    assert created_proxies[1].device_id == 1
+    assert created_proxies[0].wait_ready_called is True
+    assert created_proxies[1].wait_ready_called is True
+    assert engine._worker_queue.qsize() == 2
+
+    # First transcribe should use device 0
+    res1 = engine.transcribe(str(dummy_audio))
+    assert res1["text"] == "device_0_transcribed"
+    assert engine._worker_queue.qsize() == 2
+
+    # Second transcribe should use device 1
+    res2 = engine.transcribe(str(dummy_audio))
+    assert res2["text"] == "device_1_transcribed"
+
+    # Test immediate sleep forwarding
+    engine.enter_sleep()
+    assert created_proxies[0].sleep_called is True
+    assert created_proxies[1].sleep_called is True
+    assert engine.is_sleeping is True
+
+    # Test unload
+    await engine.unload()
+    assert created_proxies[0].stop_called is True
+    assert created_proxies[1].stop_called is True
+    assert len(engine._workers) == 0
+    assert engine._worker_queue.empty()
+
+
+def test_system_monitor_multi_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify SystemMonitor aggregates multi-GPU VRAM and max utilization."""
+    import sys
+
+    from src.monitor import SystemMonitor
+
+    monitor = SystemMonitor()
+
+    class MockUtil:
+        def __init__(self, gpu):
+            self.gpu = gpu
+
+    class MockMem:
+        def __init__(self, used_mb, total_mb):
+            self.used = used_mb * 1024 * 1024
+            self.total = total_mb * 1024 * 1024
+
+    mock_nvml = MagicMock()
+    mock_nvml.nvmlDeviceGetCount.return_value = 2
+    mock_nvml.nvmlDeviceGetHandleByIndex.side_effect = ["h0", "h1"]
+    mock_nvml.nvmlDeviceGetUtilizationRates.side_effect = [MockUtil(25.0), MockUtil(80.0)]
+    mock_nvml.nvmlDeviceGetMemoryInfo.side_effect = [MockMem(2000, 24000), MockMem(4000, 24000)]
+
+    monkeypatch.setitem(sys.modules, "pynvml", mock_nvml)
+
+    util, used_mb, total_mb = monitor._collect_gpu()
+    assert util == 80.0
+    assert used_mb == 6000
+    assert total_mb == 48000

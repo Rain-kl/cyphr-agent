@@ -4,6 +4,7 @@
 import gc
 import logging
 import os
+import queue
 import subprocess
 import threading
 from collections.abc import Callable
@@ -96,6 +97,55 @@ def resolve_device_and_dtype(work_mode: str = "gpu") -> tuple[str, Any, int]:
     return "cpu", torch.float32, int(os.getenv("QWEN3_ASR_BATCH_SIZE", "1"))
 
 
+def resolve_devices(work_mode: str = "gpu") -> list[int | str]:
+    """Resolve list of target inference device identifiers (GPU indices or 'cpu')."""
+    import torch
+
+    env_device = os.getenv("QWEN3_ASR_DEVICE", "").strip().lower()
+    explicit_idx = os.getenv("CUDA_DEVICE_INDEX", "").strip()
+
+    if env_device and env_device not in ("all", "multi", "gpu", "cuda"):
+        if env_device == "cpu":
+            return ["cpu"]
+        if env_device.startswith("cuda:"):
+            try:
+                return [int(env_device.split(":")[1])]
+            except ValueError:
+                return [0]
+        return [env_device]
+
+    if explicit_idx:
+        try:
+            return [int(explicit_idx)]
+        except ValueError:
+            pass
+
+    req_device = work_mode.strip().lower()
+    if req_device == "cpu":
+        return ["cpu"]
+
+    if req_device.startswith("cuda:"):
+        try:
+            return [int(req_device.split(":")[1])]
+        except ValueError:
+            return [0]
+
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        if env_vis := os.getenv("CUDA_VISIBLE_DEVICES"):
+            parts = [p.strip() for p in env_vis.split(",") if p.strip()]
+            valid: list[int | str] = []
+            for p in parts:
+                try:
+                    valid.append(int(p))
+                except ValueError:
+                    pass
+            if valid:
+                return valid
+        return list(range(torch.cuda.device_count()))
+
+    return ["cpu"]
+
+
 def resolve_model_dir(model_name: str = MODEL_NAME) -> Path:
     """Local model package dir:
     1. Dedicated env: $QWEN3_ASR_1_7B_MODEL_DIR or $QWEN3_ASR_0_6B_MODEL_DIR
@@ -127,7 +177,10 @@ class Qwen3ASREngine(BaseEngine):
         self.batch_size = max(1, min(8, int(os.getenv("QWEN3_ASR_BATCH_SIZE", "4"))))
         self.gpu_memory_utilization = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.60"))
         self.max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", "16384"))
+        self.enforce_eager = os.getenv("VLLM_ENFORCE_EAGER", "1").lower() in ("1", "true", "yes")
         self.sleep_idle_seconds = float(os.getenv("VLLM_SLEEP_IDLE_SECONDS", "5.0"))
+        self._workers: list[Any] = []
+        self._worker_queue: queue.Queue[Any] = queue.Queue()
         self._model = None
         self._lock = threading.Lock()
         self._sleep_timer: threading.Timer | None = None
@@ -141,6 +194,12 @@ class Qwen3ASREngine(BaseEngine):
 
     def enter_sleep(self) -> None:
         """Immediately enter Sleep Mode to offload KV cache without waiting for idle timer."""
+        if self._workers:
+            for w in self._workers:
+                w.enter_sleep()
+            with self._lock:
+                self._is_sleeping = True
+            return
         self._enter_sleep()
 
     def _cancel_sleep_timer_locked(self) -> None:
@@ -194,43 +253,89 @@ class Qwen3ASREngine(BaseEngine):
         with self._lock:
             self._arm_sleep_timer_locked()
 
-    def _load_blocking(self, work_mode: str = "gpu") -> None:
-        from qwen_asr import Qwen3ASRModel
+    def _cleanup_workers_locked(self) -> None:
+        for w in self._workers:
+            try:
+                w.stop()
+            except Exception as e:
+                logger.warning("Error stopping worker %s: %s", getattr(w, "device_id", None), e)
+        self._workers.clear()
+        while not self._worker_queue.empty():
+            try:
+                self._worker_queue.get_nowait()
+            except Exception:
+                break
 
-        model_source: str
+    def _resolve_model_source(self) -> str:
         if self.model_dir.joinpath("config.json").is_file():
-            model_source = str(self.model_dir.resolve())
-        elif self.model_name.lower() in HF_REPO_MAP:
+            return str(self.model_dir.resolve())
+        if self.model_name.lower() in HF_REPO_MAP:
             model_source = HF_REPO_MAP[self.model_name.lower()]
             logger.info(
                 "Local weights not found at %s; loading directly via Hugging Face ID: %s",
                 self.model_dir,
                 model_source,
             )
-        else:
-            raise FileNotFoundError(
-                f"Model package missing in {self.model_dir}. "
-                f"Please download model '{self.model_name}' first using cyphr-installer."
-            )
+            return model_source
+        raise FileNotFoundError(
+            f"Model package missing in {self.model_dir}. "
+            f"Please download model '{self.model_name}' first using cyphr-installer."
+        )
+
+    def _load_blocking(self, work_mode: str = "gpu") -> None:
+        from qwen_asr import Qwen3ASRModel
+
+        model_source = self._resolve_model_source()
+        devices = resolve_devices(work_mode)
 
         logger.info(
-            "Initializing Qwen3-ASR vLLM engine for %s from %s (gpu_util=%.2f, max_model_len=%d, batch_size=%d)...",
+            "Initializing Qwen3-ASR vLLM engine for %s from %s on devices %s (gpu_util=%.2f, max_model_len=%d, batch_size=%d)...",
             self.model_name,
             model_source,
+            devices,
             self.gpu_memory_utilization,
             self.max_model_len,
             self.batch_size,
         )
 
+        force_pool = os.getenv("VLLM_FORCE_WORKER_POOL", "").lower() in ("1", "true", "yes")
+        if len(devices) > 1 or force_pool:
+            from .worker import WorkerProxy
+
+            with self._lock:
+                self._cleanup_workers_locked()
+                for dev in devices:
+                    wp = WorkerProxy(
+                        device_id=dev,
+                        model_source=model_source,
+                        model_name=self.model_name,
+                        gpu_memory_utilization=self.gpu_memory_utilization,
+                        max_model_len=self.max_model_len,
+                        batch_size=self.batch_size,
+                        enforce_eager=self.enforce_eager,
+                        sleep_idle_seconds=self.sleep_idle_seconds,
+                    )
+                    wp.wait_ready()
+                    self._workers.append(wp)
+                    self._worker_queue.put(wp)
+
+                if self._workers:
+                    self._model = self._workers[0]
+            return
+
+        os.environ["HF_HUB_OFFLINE"] = "1"
         self._model = Qwen3ASRModel.LLM(
             model=model_source,
             gpu_memory_utilization=self.gpu_memory_utilization,
             max_model_len=self.max_model_len,
             max_inference_batch_size=self.batch_size,
+            enable_sleep_mode=True,
+            enforce_eager=self.enforce_eager,
         )
 
     async def unload(self) -> None:
         with self._lock:
+            self._cleanup_workers_locked()
             self._cancel_sleep_timer_locked()
             self._is_sleeping = False
             self._model = None
@@ -253,6 +358,23 @@ class Qwen3ASREngine(BaseEngine):
         log_callback: Callable[[int, str], Any] | None = None,
     ) -> dict[str, Any]:
         """Sync (runs in job_runner's executor): ffmpeg -> chunk -> vLLM transcribe -> verbose_json."""
+        if self._workers:
+            if not self.loaded:
+                raise RuntimeError(f"Model '{self.model_name}' is not loaded")
+            if not os.path.isfile(audio_path):
+                raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
+
+            worker = self._worker_queue.get()
+            try:
+                return worker.execute_transcribe(
+                    audio_path=audio_path,
+                    language=language,
+                    task_type=task_type,
+                    log_callback=log_callback,
+                )
+            finally:
+                self._worker_queue.put(worker)
+
         from qwen_asr.inference.utils import (
             SAMPLE_RATE,
             normalize_audio_input,

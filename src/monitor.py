@@ -59,14 +59,18 @@ class SystemMonitor:
             pynvml.nvmlInit()
             device_count = pynvml.nvmlDeviceGetCount()
             if device_count > 0:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                return (
-                    float(util.gpu),
-                    int(mem_info.used // (1024 * 1024)),
-                    int(mem_info.total // (1024 * 1024)),
-                )
+                total_used = 0
+                total_mem = 0
+                utils: list[float] = []
+                for idx in range(device_count):
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                    u = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    m = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    utils.append(float(u.gpu))
+                    total_used += int(m.used // (1024 * 1024))
+                    total_mem += int(m.total // (1024 * 1024))
+                peak_util = max(utils) if utils else 0.0
+                return (peak_util, total_used, total_mem)
         except Exception:
             pass
 
@@ -75,9 +79,14 @@ class SystemMonitor:
             import torch  # type: ignore
 
             if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-                mem_allocated = torch.cuda.memory_allocated(0) // (1024 * 1024)
-                total_mem = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
-                return (0.0, int(mem_allocated), int(total_mem))
+                dev_count = torch.cuda.device_count()
+                total_allocated = sum(torch.cuda.memory_allocated(i) for i in range(dev_count)) // (
+                    1024 * 1024
+                )
+                total_mem = sum(
+                    torch.cuda.get_device_properties(i).total_memory for i in range(dev_count)
+                ) // (1024 * 1024)
+                return (0.0, int(total_allocated), int(total_mem))
         except Exception:
             pass
 
