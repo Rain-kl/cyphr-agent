@@ -9,7 +9,9 @@ import pytest
 
 from src.config import AgentConfig
 from src.models.hy_mt2 import (
+    ALIAS_HY_MT2_7B_GGUF_SHORT,
     MODEL_NAME_HY_MT2,
+    MODEL_NAME_HY_MT2_7B_GGUF,
     HyMT2Engine,
     format_translation_prompt,
 )
@@ -197,3 +199,41 @@ async def test_concurrent_chat_completion_multiplexing(monkeypatch: pytest.Monke
 
     for req_id in req_ids:
         assert len(received_by_req[req_id]) > 0, f"Request {req_id} should have received chunks"
+
+
+@pytest.mark.asyncio
+async def test_hy_mt2_7b_gguf_mock_streaming(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Hy-MT2-7B-GGUF engine detects GGUF format and streams generation."""
+    monkeypatch.setenv("HY_MT2_MOCK", "1")
+    engine = HyMT2Engine(model_name=MODEL_NAME_HY_MT2_7B_GGUF)
+    assert engine.is_gguf is True
+
+    await engine.load(work_mode="cpu")
+    assert engine.loaded is True
+
+    chunks: list[str] = []
+    final_reason = None
+    async for delta, reason in engine.generate_stream(
+        request_id="test-7b-req",
+        prompt="Translating with 7B GGUF",
+        target_lang="zh",
+    ):
+        if delta:
+            chunks.append(delta)
+        if reason:
+            final_reason = reason
+
+    assert len(chunks) > 0
+    assert final_reason == "stop"
+
+
+def test_registry_hy_mt2_7b_gguf() -> None:
+    """Verify ModelRegistry registers 7B GGUF model and its aliases."""
+    registry = ModelRegistry(debug=True)
+    available = registry.list_available_models()
+
+    assert MODEL_NAME_HY_MT2_7B_GGUF in available
+    assert ALIAS_HY_MT2_7B_GGUF_SHORT in available
+
+    engine = registry.get_engine(MODEL_NAME_HY_MT2_7B_GGUF)
+    assert engine is None  # Not loaded yet

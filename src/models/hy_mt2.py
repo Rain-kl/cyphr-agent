@@ -19,6 +19,11 @@ ALIAS_HY_MT2_SHORT = "hy-mt2-1.8b"
 ALIAS_HY_MT2_CAMEL = "Hy-MT2-1.8B"
 HF_REPO_ID = "tencent/Hy-MT2-1.8B"
 
+MODEL_NAME_HY_MT2_7B_GGUF = "tencent/Hy-MT2-7B-GGUF"
+ALIAS_HY_MT2_7B_GGUF_SHORT = "hy-mt2-7b-gguf"
+ALIAS_HY_MT2_7B_GGUF_CAMEL = "Hy-MT2-7B-GGUF"
+HF_REPO_ID_7B_GGUF = "tencent/Hy-MT2-7B-GGUF"
+
 LANG_MAP = {
     "zh": "Chinese",
     "en": "English",
@@ -38,7 +43,22 @@ LANG_MAP = {
 
 
 def resolve_model_dir(model_name: str = MODEL_NAME_HY_MT2) -> Path:
-    """Resolve local model directory for Hy-MT2-1.8B."""
+    """Resolve local model directory for Hy-MT2 models."""
+    norm = model_name.lower().strip()
+    is_7b = "7b" in norm
+
+    if is_7b:
+        if env := os.getenv("HY_MT2_7B_GGUF_MODEL_DIR"):
+            return Path(env)
+        if env := os.getenv("HY_MT2_7B_MODEL_DIR"):
+            return Path(env)
+        base_dir = Path(__file__).resolve().parent.parent.parent / "models"
+        for candidate in ["hy-mt2-7b-gguf", "Hy-MT2-7B-GGUF", "tencent/Hy-MT2-7B-GGUF", "hy-mt2-7b"]:
+            p = base_dir / candidate
+            if p.is_dir():
+                return p
+        return base_dir / "hy-mt2-7b-gguf"
+
     if env := os.getenv("HY_MT2_1_8B_MODEL_DIR"):
         return Path(env)
     if env := os.getenv("HY_MT2_MODEL_DIR"):
@@ -56,7 +76,7 @@ def format_translation_prompt(
     target_lang: str = "zh",
     source_lang: str | None = None,
 ) -> str:
-    """Format input text with translation instructions for Tencent Hy-MT2-1.8B.
+    """Format input text with translation instructions for Tencent Hy-MT2 models.
 
     If the text already contains explicit translation instructions, it is returned as-is.
     """
@@ -79,7 +99,7 @@ def format_translation_prompt(
 
 
 class HyMT2Engine(BaseModelEngine):
-    """Tencent Hy-MT2-1.8B translation engine with real-time streaming inference support."""
+    """Tencent Hy-MT2 translation engine with real-time streaming inference support."""
 
     supports_concurrent_inference = True
 
@@ -89,6 +109,7 @@ class HyMT2Engine(BaseModelEngine):
         model_dir: str | Path | None = None,
     ) -> None:
         super().__init__(model_name)
+        self.is_gguf = "gguf" in self.model_name.lower()
         self.model_dir = Path(model_dir) if model_dir else resolve_model_dir(model_name)
         self.gpu_memory_utilization = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.60"))
         self.max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", "4096"))
@@ -98,7 +119,27 @@ class HyMT2Engine(BaseModelEngine):
         self._aborted_requests: set[str] = set()
         self._lock = asyncio.Lock()
 
+    def _find_gguf_file(self) -> Path | None:
+        """Find the most appropriate .gguf file in the model directory."""
+        if not self.model_dir.is_dir():
+            if self.model_dir.is_file() and self.model_dir.suffix == ".gguf":
+                return self.model_dir
+            return None
+        gguf_files = list(self.model_dir.glob("*.gguf"))
+        if not gguf_files:
+            return None
+        # Prefer Q4_K_M if available
+        for f in gguf_files:
+            if "q4_k_m" in f.name.lower():
+                return f
+        return gguf_files[0]
+
     def _resolve_model_source(self) -> str:
+        if self.is_gguf:
+            if f := self._find_gguf_file():
+                return str(f.resolve())
+            return HF_REPO_ID_7B_GGUF
+
         if self.model_dir.joinpath("config.json").is_file():
             return str(self.model_dir.resolve())
         return HF_REPO_ID
@@ -109,7 +150,13 @@ class HyMT2Engine(BaseModelEngine):
         env_debug = os.getenv("DEBUG", os.getenv("AGENT_DEBUG", "")).lower() in ("1", "true", "yes")
 
         devices = resolve_devices(work_mode)
-        if env_mock or (env_debug and not self.model_dir.joinpath("config.json").is_file()):
+        has_local = False
+        if self.is_gguf:
+            has_local = self._find_gguf_file() is not None
+        else:
+            has_local = self.model_dir.joinpath("config.json").is_file()
+
+        if env_mock or (env_debug and not has_local):
             logger.info("Initializing HyMT2Engine in mock mode for '%s'", self.model_name)
             self._mock_mode = True
             self.loaded = True
@@ -117,10 +164,11 @@ class HyMT2Engine(BaseModelEngine):
 
         model_source = self._resolve_model_source()
         logger.info(
-            "Initializing HyMT2Engine for %s from %s (devices=%s)...",
+            "Initializing HyMT2Engine for %s from %s (devices=%s, is_gguf=%s)...",
             self.model_name,
             model_source,
             devices,
+            self.is_gguf,
         )
 
         try:
@@ -134,6 +182,10 @@ class HyMT2Engine(BaseModelEngine):
                 free_ratio=free_ratio,
             )
 
+            extra_kwargs: dict[str, Any] = {}
+            if self.is_gguf:
+                extra_kwargs["quantization"] = "gguf"
+
             engine_args = AsyncEngineArgs(
                 model=model_source,
                 gpu_memory_utilization=effective_gpu_util,
@@ -141,10 +193,11 @@ class HyMT2Engine(BaseModelEngine):
                 enforce_eager=True,
                 disable_log_stats=True,
                 trust_remote_code=True,
+                **extra_kwargs,
             )
             self._engine = AsyncLLMEngine.from_engine_args(engine_args)
             self.loaded = True
-            logger.info("Successfully initialized vLLM AsyncLLMEngine for Hy-MT2")
+            logger.info("Successfully initialized vLLM AsyncLLMEngine for Hy-MT2 (%s)", self.model_name)
         except Exception as e:
             if env_debug or "cpu" in devices or not devices:
                 logger.warning("vLLM init failed (%s); falling back to mock mode", e)

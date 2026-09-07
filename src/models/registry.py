@@ -14,7 +14,10 @@ from .base import BaseEngine
 from .hy_mt2 import (
     ALIAS_HY_MT2_CAMEL,
     ALIAS_HY_MT2_SHORT,
+    ALIAS_HY_MT2_7B_GGUF_CAMEL,
+    ALIAS_HY_MT2_7B_GGUF_SHORT,
     MODEL_NAME_HY_MT2,
+    MODEL_NAME_HY_MT2_7B_GGUF,
     HyMT2Engine,
     resolve_model_dir as resolve_hy_mt2_dir,
 )
@@ -70,6 +73,11 @@ class ModelRegistry:
         self.register(MODEL_NAME_HY_MT2, lambda: HyMT2Engine(model_name=MODEL_NAME_HY_MT2))
         self.register(ALIAS_HY_MT2_SHORT, lambda: HyMT2Engine(model_name=MODEL_NAME_HY_MT2))
         self.register(ALIAS_HY_MT2_CAMEL, lambda: HyMT2Engine(model_name=MODEL_NAME_HY_MT2))
+
+        # Real model: Tencent Hy-MT2-7B-GGUF multilingual translation model
+        self.register(MODEL_NAME_HY_MT2_7B_GGUF, lambda: HyMT2Engine(model_name=MODEL_NAME_HY_MT2_7B_GGUF))
+        self.register(ALIAS_HY_MT2_7B_GGUF_SHORT, lambda: HyMT2Engine(model_name=MODEL_NAME_HY_MT2_7B_GGUF))
+        self.register(ALIAS_HY_MT2_7B_GGUF_CAMEL, lambda: HyMT2Engine(model_name=MODEL_NAME_HY_MT2_7B_GGUF))
 
         if preload_default and self._debug and "mock-whisper-base" in self._factories:
             engine = self._factories["mock-whisper-base"]()
@@ -350,6 +358,15 @@ class ModelRegistry:
                     downloaded.extend([MODEL_NAME_HY_MT2, ALIAS_HY_MT2_SHORT, ALIAS_HY_MT2_CAMEL])
         elif self._debug or os.getenv("HY_MT2_MOCK", "").lower() in ("1", "true", "yes"):
             downloaded.extend([MODEL_NAME_HY_MT2, ALIAS_HY_MT2_SHORT, ALIAS_HY_MT2_CAMEL])
+
+        # Check Hy-MT2-7B-GGUF model
+        hy_mt2_7b_dir = resolve_hy_mt2_dir(MODEL_NAME_HY_MT2_7B_GGUF)
+        if hy_mt2_7b_dir.is_dir():
+            has_gguf = any(p.suffix == ".gguf" for p in hy_mt2_7b_dir.iterdir() if p.is_file())
+            if has_gguf:
+                downloaded.extend([MODEL_NAME_HY_MT2_7B_GGUF, ALIAS_HY_MT2_7B_GGUF_SHORT, ALIAS_HY_MT2_7B_GGUF_CAMEL])
+        elif self._debug or os.getenv("HY_MT2_MOCK", "").lower() in ("1", "true", "yes"):
+            downloaded.extend([MODEL_NAME_HY_MT2_7B_GGUF, ALIAS_HY_MT2_7B_GGUF_SHORT, ALIAS_HY_MT2_7B_GGUF_CAMEL])
 
         return downloaded
 
