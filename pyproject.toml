@@ -19,6 +19,7 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
+    "ruff>=0.16.6",
 ]
 
 [tool.pytest.ini_options]
@@ -26,9 +27,56 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.ruff]
-line-length = 100
 target-version = "py312"
+line-length = 100
+exclude = [
+    ".git",
+    ".venv",
+    "models",
+    "__pycache__",
+    "build",
+    "dist",
+]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP"]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes (unused imports, variables, etc.)
+    "I",      # isort (import sorting)
+    "UP",     # pyupgrade (modern Python 3.12 syntax)
+    "B",      # flake8-bugbear (common pitfalls and bug patterns)
+    "C4",     # flake8-comprehensions (clean comprehensions)
+    "SIM",    # flake8-simplify (simplify code structure)
+    "RET",    # flake8-return (return statement consistency)
+    "RUF",    # Ruff-specific rules
+    "S",      # flake8-bandit (security checks)
+]
+ignore = [
+    "E501",   # line-too-long (handled by ruff format)
+    "SIM105", # try-except-pass vs contextlib.suppress
+    "S108",   # allow /tmp/ paths
+    "S110",   # try-except-pass detected (best-effort cleanups/fallbacks)
+    "RUF006", # asyncio.create_task without reference
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "S",       # allow all bandit checks in tests (asserts, mock passwords, etc.)
+    "PLR2004", # allow magic numbers in tests
+    "RET504",  # allow variable assignment before return in tests
+    "RET505",  # allow elif after return in tests
+    "B904",    # allow raise without from in tests
+]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["src"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+docstring-code-format = true
+
 

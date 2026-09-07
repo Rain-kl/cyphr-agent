@@ -24,6 +24,7 @@ from src.ws_client import AgentWebSocketClient
 # 1. Config Tests
 # =========================================================================
 
+
 def test_config_defaults() -> None:
     config = AgentConfig()
     assert config.controller_url == "http://localhost:8080"
@@ -42,10 +43,7 @@ def test_config_ws_url_with_token_and_https() -> None:
         agent_token="sec-token-123",
     )
     assert config.http_base_url == "https://api.transcribe.io:8443"
-    assert (
-        config.ws_url
-        == "wss://api.transcribe.io:8443/api/v1/agent/ws?token=sec-token-123"
-    )
+    assert config.ws_url == "wss://api.transcribe.io:8443/api/v1/agent/ws?token=sec-token-123"
 
 
 def test_config_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -81,6 +79,7 @@ def test_config_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 # 2. Monitor Tests
 # =========================================================================
 
+
 def test_monitor_collect() -> None:
     monitor = SystemMonitor()
     stats = monitor.collect()
@@ -115,6 +114,7 @@ def test_monitor_gpu_fallback() -> None:
 # =========================================================================
 # 3. Mock ASR Engine Tests
 # =========================================================================
+
 
 @pytest.mark.asyncio
 async def test_mock_asr_engine_transcribe_and_progress(tmp_path: Path) -> None:
@@ -169,6 +169,7 @@ async def test_mock_asr_engine_missing_file() -> None:
 # =========================================================================
 # 4. Model Registry Tests
 # =========================================================================
+
 
 @pytest.mark.asyncio
 async def test_model_registry_default_no_mock() -> None:
@@ -228,6 +229,7 @@ async def test_model_registry_lifecycle() -> None:
 # =========================================================================
 # 5. Reporter Tests
 # =========================================================================
+
 
 @pytest.mark.asyncio
 async def test_reporter_download_logs_complete(tmp_path: Path) -> None:
@@ -296,6 +298,7 @@ async def test_reporter_download_logs_complete(tmp_path: Path) -> None:
 # 6. Job Runner & Exception Shielding Tests
 # =========================================================================
 
+
 @pytest.mark.asyncio
 async def test_job_runner_success(tmp_path: Path) -> None:
     media_dir = tmp_path / "agent_media"
@@ -329,12 +332,14 @@ async def test_job_runner_success(tmp_path: Path) -> None:
         max_concurrent_jobs=2,
     )
 
-    task = runner.run_job({
-        "job_id": 501,
-        "model_name": "mock-whisper-base",
-        "task_type": "transcribe",
-        "media_path": "/api/v1/agent/jobs/501/media",
-    })
+    task = runner.run_job(
+        {
+            "job_id": 501,
+            "model_name": "mock-whisper-base",
+            "task_type": "transcribe",
+            "media_path": "/api/v1/agent/jobs/501/media",
+        }
+    )
     await task
 
     # Assert settlement
@@ -380,11 +385,13 @@ async def test_job_runner_exception_shielding_no_crash(tmp_path: Path) -> None:
     )
 
     # Launch failing job
-    task = runner.run_job({
-        "job_id": 999,
-        "model_name": "mock-whisper-base",
-        "media_path": "/api/v1/agent/jobs/999/media",
-    })
+    task = runner.run_job(
+        {
+            "job_id": 999,
+            "model_name": "mock-whisper-base",
+            "media_path": "/api/v1/agent/jobs/999/media",
+        }
+    )
     await task
 
     # Verify status="failed" reported and error recorded
@@ -406,11 +413,13 @@ async def test_job_runner_exception_shielding_no_crash(tmp_path: Path) -> None:
         return httpx.Response(404)
 
     reporter.client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler_success))
-    task2 = runner.run_job({
-        "job_id": 1000,
-        "model_name": "mock-whisper-base",
-        "media_path": "/api/v1/agent/jobs/1000/media",
-    })
+    task2 = runner.run_job(
+        {
+            "job_id": 1000,
+            "model_name": "mock-whisper-base",
+            "media_path": "/api/v1/agent/jobs/1000/media",
+        }
+    )
     await task2
     assert len(complete_data) == 2
     assert complete_data[1]["status"] == "completed"
@@ -419,6 +428,7 @@ async def test_job_runner_exception_shielding_no_crash(tmp_path: Path) -> None:
 # =========================================================================
 # 7. WebSocket Client Message Routing Tests
 # =========================================================================
+
 
 @pytest.mark.asyncio
 async def test_ws_client_message_routing() -> None:
@@ -506,11 +516,13 @@ async def test_ws_client_message_loop_resilience() -> None:
         json.dumps([1, 2, 3]),  # list payload (non-dict)
         json.dumps("string payload"),  # string payload (non-dict)
         json.dumps({"type": "fail_action"}),  # raises exception
-        json.dumps({
-            "type": "command",
-            "action": "dispatch_job",
-            "payload": {"job_id": 77},
-        }),
+        json.dumps(
+            {
+                "type": "command",
+                "action": "dispatch_job",
+                "payload": {"job_id": 77},
+            }
+        ),
     ]
     mock_ws = MockAsyncIterWS(messages)
 
@@ -591,11 +603,13 @@ async def test_job_runner_sync_engine_gil_protection(tmp_path: Path) -> None:
         max_concurrent_jobs=1,
     )
 
-    task = runner.run_job({
-        "job_id": 777,
-        "model_name": "pure-sync-engine",
-        "media_path": "/api/v1/agent/jobs/777/media",
-    })
+    task = runner.run_job(
+        {
+            "job_id": 777,
+            "model_name": "pure-sync-engine",
+            "media_path": "/api/v1/agent/jobs/777/media",
+        }
+    )
     await task
 
     assert len(complete_data) == 1
@@ -704,7 +718,9 @@ async def test_ws_client_work_mode_and_unload_all_handling() -> None:
     mock_ws = AsyncMock()
 
     # 1. Test unload_all_models message
-    await client._handle_message(mock_ws, {"type": "command", "action": "unload_all_models", "payload": {}})
+    await client._handle_message(
+        mock_ws, {"type": "command", "action": "unload_all_models", "payload": {}}
+    )
     assert len(registry.list_loaded_models()) == 0
     assert mock_ws.send.called
     status_msg = json.loads(mock_ws.send.call_args[0][0])
@@ -713,15 +729,19 @@ async def test_ws_client_work_mode_and_unload_all_handling() -> None:
 
     # 2. Test set_work_mode message
     mock_ws.reset_mock()
-    await client._handle_message(mock_ws, {"type": "command", "action": "set_work_mode", "payload": {"mode": "cpu"}})
+    await client._handle_message(
+        mock_ws, {"type": "command", "action": "set_work_mode", "payload": {"mode": "cpu"}}
+    )
     assert registry.get_current_mode() == "cpu"
     assert mock_ws.send.call_count >= 1
 
 
-
-def test_qwen3_asr_missing_ffmpeg_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.models.qwen3_asr import Qwen3ASREngine
+def test_qwen3_asr_missing_ffmpeg_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import subprocess
+
+    from src.models.qwen3_asr import Qwen3ASREngine
 
     engine = Qwen3ASREngine("qwen3-asr-0.6b")
     engine.loaded = True
@@ -747,6 +767,7 @@ def test_qwen3_asr_missing_ffmpeg_clear_error(tmp_path: Path, monkeypatch: pytes
 async def test_concurrent_jobs_inference_serialization(tmp_path: Path) -> None:
     """Verify multiple concurrent jobs serialize their inference phase without collision."""
     import time
+
     media_dir = tmp_path / "media"
     media_dir.mkdir()
 
@@ -810,9 +831,27 @@ async def test_concurrent_jobs_inference_serialization(tmp_path: Path) -> None:
         max_concurrent_jobs=3,
     )
 
-    t1 = runner.run_job({"job_id": 101, "model_name": "tracking-engine", "media_path": "/api/v1/agent/jobs/101/media"})
-    t2 = runner.run_job({"job_id": 102, "model_name": "tracking-engine", "media_path": "/api/v1/agent/jobs/102/media"})
-    t3 = runner.run_job({"job_id": 103, "model_name": "tracking-engine", "media_path": "/api/v1/agent/jobs/103/media"})
+    t1 = runner.run_job(
+        {
+            "job_id": 101,
+            "model_name": "tracking-engine",
+            "media_path": "/api/v1/agent/jobs/101/media",
+        }
+    )
+    t2 = runner.run_job(
+        {
+            "job_id": 102,
+            "model_name": "tracking-engine",
+            "media_path": "/api/v1/agent/jobs/102/media",
+        }
+    )
+    t3 = runner.run_job(
+        {
+            "job_id": 103,
+            "model_name": "tracking-engine",
+            "media_path": "/api/v1/agent/jobs/103/media",
+        }
+    )
 
     await asyncio.gather(t1, t2, t3)
 
@@ -824,8 +863,9 @@ async def test_concurrent_jobs_inference_serialization(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_concurrent_jobs_inference_parallel_when_supported(tmp_path: Path) -> None:
     """Verify engines with supports_concurrent_inference=True execute concurrently without serialization."""
-    import time
     import threading
+    import time
+
     media_dir = tmp_path / "media_par"
     media_dir.mkdir()
 
@@ -894,9 +934,27 @@ async def test_concurrent_jobs_inference_parallel_when_supported(tmp_path: Path)
         max_concurrent_jobs=3,
     )
 
-    t1 = runner.run_job({"job_id": 201, "model_name": "concurrent-engine", "media_path": "/api/v1/agent/jobs/201/media"})
-    t2 = runner.run_job({"job_id": 202, "model_name": "concurrent-engine", "media_path": "/api/v1/agent/jobs/202/media"})
-    t3 = runner.run_job({"job_id": 203, "model_name": "concurrent-engine", "media_path": "/api/v1/agent/jobs/203/media"})
+    t1 = runner.run_job(
+        {
+            "job_id": 201,
+            "model_name": "concurrent-engine",
+            "media_path": "/api/v1/agent/jobs/201/media",
+        }
+    )
+    t2 = runner.run_job(
+        {
+            "job_id": 202,
+            "model_name": "concurrent-engine",
+            "media_path": "/api/v1/agent/jobs/202/media",
+        }
+    )
+    t3 = runner.run_job(
+        {
+            "job_id": 203,
+            "model_name": "concurrent-engine",
+            "media_path": "/api/v1/agent/jobs/203/media",
+        }
+    )
 
     await asyncio.gather(t1, t2, t3)
 
@@ -908,6 +966,7 @@ async def test_concurrent_jobs_inference_parallel_when_supported(tmp_path: Path)
 # =========================================================================
 # 8. P0 Concurrency & Lifecycle Protection Tests
 # =========================================================================
+
 
 @pytest.mark.asyncio
 async def test_concurrent_load_model_singleton() -> None:
@@ -1072,6 +1131,7 @@ async def test_dynamic_semaphore_scale_down() -> None:
 @pytest.mark.asyncio
 async def test_acquire_engine_drain_timeout_force_unload() -> None:
     """Verify unload_model timeout forces unload when inference takes longer than timeout."""
+
     class LongInferenceEngine(BaseEngine):
         def __init__(self) -> None:
             super().__init__("long-model")
@@ -1116,6 +1176,7 @@ async def test_acquire_engine_drain_timeout_force_unload() -> None:
 @pytest.mark.asyncio
 async def test_acquire_engine_exception_resilience() -> None:
     """Verify acquire_engine properly decrements reference count even if inference raises exception."""
+
     class FaultyEngine(BaseEngine):
         def __init__(self) -> None:
             super().__init__("faulty-model")
@@ -1151,9 +1212,11 @@ async def test_acquire_engine_exception_resilience() -> None:
 # 9. P1 In-Memory Audio Pipeline & Multi-GPU Tests
 # =========================================================================
 
+
 def test_resolve_device_and_dtype_rules(monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.models.qwen3_asr import resolve_device_and_dtype
     import torch
+
+    from src.models.qwen3_asr import resolve_device_and_dtype
 
     # 1. CPU explicit
     dev, dtype, bs = resolve_device_and_dtype("cpu")
@@ -1174,9 +1237,11 @@ def test_resolve_device_and_dtype_rules(monkeypatch: pytest.MonkeyPatch) -> None
         assert dtype == torch.float32
 
     # 4. Multi-GPU device selection via CUDA_DEVICE_INDEX
-    with patch("torch.cuda.is_available", return_value=True), \
-         patch("torch.cuda.device_count", return_value=4), \
-         patch("torch.cuda.is_bf16_supported", return_value=True):
+    with (
+        patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.device_count", return_value=4),
+        patch("torch.cuda.is_bf16_supported", return_value=True),
+    ):
         monkeypatch.setenv("CUDA_DEVICE_INDEX", "2")
         dev, dtype, bs = resolve_device_and_dtype("gpu")
         assert dev == "cuda:2"
@@ -1187,8 +1252,10 @@ def test_resolve_device_and_dtype_rules(monkeypatch: pytest.MonkeyPatch) -> None
 def test_registry_multi_gpu_discovery() -> None:
     from src.models.registry import detect_supported_modes
 
-    with patch("torch.cuda.is_available", return_value=True), \
-         patch("torch.cuda.device_count", return_value=3):
+    with (
+        patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.device_count", return_value=3),
+    ):
         modes, default_mode = detect_supported_modes()
         assert "cpu" in modes
         assert "gpu" in modes
@@ -1201,7 +1268,9 @@ def test_registry_multi_gpu_discovery() -> None:
 def test_qwen3_asr_in_memory_ffmpeg_pipe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify non-standard audio uses in-memory pipe and never writes temporary wav files to disk."""
     import subprocess
+
     import numpy as np
+
     from src.models.qwen3_asr import Qwen3ASREngine
 
     engine = Qwen3ASREngine("qwen3-asr-0.6b")
@@ -1221,7 +1290,9 @@ def test_qwen3_asr_in_memory_ffmpeg_pipe(tmp_path: Path, monkeypatch: pytest.Mon
 
     # Generate 1 second of fake 16kHz int16 PCM data
     sample_rate = 16000
-    fake_pcm_samples = (np.sin(np.linspace(0, 2 * np.pi * 440, sample_rate)) * 16000).astype(np.int16)
+    fake_pcm_samples = (np.sin(np.linspace(0, 2 * np.pi * 440, sample_rate)) * 16000).astype(
+        np.int16
+    )
     fake_pcm_bytes = fake_pcm_samples.tobytes()
 
     executed_cmd = []
@@ -1260,6 +1331,7 @@ def test_qwen3_asr_in_memory_ffmpeg_pipe(tmp_path: Path, monkeypatch: pytest.Mon
 # 9. Qwen3-ASR vLLM Engine Configuration & Inference Tests
 # =========================================================================
 
+
 def test_qwen3_asr_vllm_engine_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify Qwen3ASREngine default configuration and environment variable overrides."""
     from src.models.qwen3_asr import Qwen3ASREngine
@@ -1284,10 +1356,13 @@ def test_qwen3_asr_vllm_engine_configuration(monkeypatch: pytest.MonkeyPatch) ->
     assert engine_custom.batch_size == 6
 
 
-def test_qwen3_asr_vllm_load_blocking_instantiation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_qwen3_asr_vllm_load_blocking_instantiation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Verify _load_blocking calls Qwen3ASRModel.LLM with appropriate arguments."""
-    from src.models.qwen3_asr import Qwen3ASREngine
     import json
+
+    from src.models.qwen3_asr import Qwen3ASREngine
 
     model_dir = tmp_path / "mock_qwen3"
     model_dir.mkdir()
@@ -1317,12 +1392,14 @@ def test_qwen3_asr_vllm_load_blocking_instantiation(monkeypatch: pytest.MonkeyPa
 
 def test_qwen3_asr_vllm_transcribe_thread_safe_lock(tmp_path: Path) -> None:
     """Verify concurrent transcribe requests are serialized through engine lock."""
-    from src.models.qwen3_asr import Qwen3ASREngine
+    import concurrent.futures
+    import threading
+    import time
+
     import numpy as np
     import soundfile as sf
-    import concurrent.futures
-    import time
-    import threading
+
+    from src.models.qwen3_asr import Qwen3ASREngine
 
     engine = Qwen3ASREngine("qwen3-asr-0.6b")
     engine.loaded = True
@@ -1332,6 +1409,7 @@ def test_qwen3_asr_vllm_transcribe_thread_safe_lock(tmp_path: Path) -> None:
     lock = threading.Lock()
 
     mock_m = MagicMock()
+
     def mock_transcribe(audio: list, language: str | None = None) -> list:
         nonlocal concurrent_calls, max_concurrent_observed
         with lock:
@@ -1365,4 +1443,3 @@ def test_qwen3_asr_vllm_transcribe_thread_safe_lock(tmp_path: Path) -> None:
     assert all("vllm transcribed text" in r["text"] for r in results)
     # The lock must guarantee max concurrent inside transcribe loop is 1
     assert max_concurrent_observed == 1
-

@@ -77,11 +77,13 @@ def load_config(config_path: str | Path | None = None) -> AgentConfig:
     elif os.getenv("CONFIG_PATH"):
         candidate_paths.append(Path(os.getenv("CONFIG_PATH", "")))
     else:
-        candidate_paths.extend([
-            Path("config.yaml"),
-            Path("backend/agent/config.yaml"),
-            Path(__file__).resolve().parent.parent / "config.yaml",
-        ])
+        candidate_paths.extend(
+            [
+                Path("config.yaml"),
+                Path("backend/agent/config.yaml"),
+                Path(__file__).resolve().parent.parent / "config.yaml",
+            ]
+        )
 
     for p in candidate_paths:
         if p.is_file():

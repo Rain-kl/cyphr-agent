@@ -67,3 +67,13 @@ uv run python main.py
 ```bash
 uv run pytest
 ```
+
+### Code Linting & Formatting
+
+```bash
+uv run ruff check .          # Static analysis and linting
+uv run ruff check --fix .    # Auto-fix lint violations
+uv run ruff format .         # Code formatting
+uv run ruff format --check . # Verify formatting in CI
+```
+

@@ -7,7 +7,7 @@ import signal
 
 from .config import load_config
 from .job_runner import JobRunner
-from .models.registry import ModelRegistry, default_registry
+from .models.registry import ModelRegistry
 from .monitor import SystemMonitor
 from .reporter import Reporter
 from .ws_client import AgentWebSocketClient

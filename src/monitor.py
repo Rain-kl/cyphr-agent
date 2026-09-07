@@ -76,10 +76,7 @@ class SystemMonitor:
 
             if torch.cuda.is_available() and torch.cuda.device_count() > 0:
                 mem_allocated = torch.cuda.memory_allocated(0) // (1024 * 1024)
-                total_mem = (
-                    torch.cuda.get_device_properties(0).total_memory
-                    // (1024 * 1024)
-                )
+                total_mem = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
                 return (0.0, int(mem_allocated), int(total_mem))
         except Exception:
             pass

@@ -90,7 +90,9 @@ class JobRunner:
     def set_max_concurrent_jobs(self, limit: int) -> None:
         """Update maximum concurrency limit dynamically."""
         if limit > 0 and limit != self.max_concurrent_jobs:
-            logger.info("Updating max concurrent jobs from %d to %d", self.max_concurrent_jobs, limit)
+            logger.info(
+                "Updating max concurrent jobs from %d to %d", self.max_concurrent_jobs, limit
+            )
             self.max_concurrent_jobs = limit
             self._semaphore.set_capacity(limit)
 
@@ -132,11 +134,13 @@ class JobRunner:
                 await self.reporter.report_logs(
                     job_id=job_id,
                     progress=5,
-                    logs=[{
-                        "timestamp": now_iso,
-                        "level": "info",
-                        "message": f"Job {job_id} scheduled on agent node (model: {model_name})",
-                    }],
+                    logs=[
+                        {
+                            "timestamp": now_iso,
+                            "level": "info",
+                            "message": f"Job {job_id} scheduled on agent node (model: {model_name})",
+                        }
+                    ],
                 )
 
                 # 2. Download media
@@ -144,11 +148,13 @@ class JobRunner:
                 await self.reporter.report_logs(
                     job_id=job_id,
                     progress=10,
-                    logs=[{
-                        "timestamp": now_iso,
-                        "level": "info",
-                        "message": "Downloading media file...",
-                    }],
+                    logs=[
+                        {
+                            "timestamp": now_iso,
+                            "level": "info",
+                            "message": "Downloading media file...",
+                        }
+                    ],
                 )
                 await self.reporter.download_media(job_id, local_file_path)
 
@@ -209,11 +215,13 @@ class JobRunner:
                             await self.reporter.report_logs(
                                 job_id=job_id,
                                 progress=15,
-                                logs=[{
-                                    "timestamp": datetime.now(UTC).isoformat(),
-                                    "level": "info",
-                                    "message": "Waiting for inference engine to become available...",
-                                }],
+                                logs=[
+                                    {
+                                        "timestamp": datetime.now(UTC).isoformat(),
+                                        "level": "info",
+                                        "message": "Waiting for inference engine to become available...",
+                                    }
+                                ],
                             )
 
                         async with self._inference_lock:
